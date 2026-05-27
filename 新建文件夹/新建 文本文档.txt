@@ -11,6 +11,7 @@
 // @grant        GM_listValues
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
+// @grant        unsafeWindow
 // ==/UserScript==
 
 (function () {
@@ -224,20 +225,48 @@
         });
     }
 
+    // 归一化 bill_detail 的 data：兼容字符串(双层 JSON / 编码)、数组、嵌套对象
+    function normalizeBillData(raw) {
+        let d = raw;
+        if (typeof d === 'string') {
+            try { d = JSON.parse(d); }
+            catch (e) { return { ok: false, kind: 'string', preview: d.slice(0, 200) }; }
+        }
+        if (Array.isArray(d)) d = d[0];
+        if (d && typeof d === 'object') {
+            // 有些后端会再包一层 detail / bill
+            if (!pickPublicEndDate(d)) {
+                for (const k of ['detail', 'bill', 'data', 'sellbill']) {
+                    if (d[k] && typeof d[k] === 'object' && pickPublicEndDate(d[k])) { d = d[k]; break; }
+                }
+            }
+            return { ok: true, kind: 'object', value: d };
+        }
+        return { ok: false, kind: typeof raw, preview: String(raw).slice(0, 200) };
+    }
     async function apiBillDetail(billId) {
-        // 先用 basic（更轻），若没有公示时间字段则降级试 all / 不传 part
         const tries = [{ billId, part: 'basic' }, { billId, part: 'all' }, { billId }];
-        let lastResp;
+        let lastPreview = null;
         for (const body of tries) {
             const r = await callApi(EP.billDetail, body);
-            lastResp = r;
-            if (r.status !== 0) continue;
-            const d = r.data || {};
-            if (pickPublicEndDate(d) && pickPrice(d) != null) return d;
-            // 字段不全，继续下一种 part
-            log('bill_detail 字段不全，重试', body, '响应 keys=', Object.keys(d));
+            if (r.status !== 0) {
+                log('bill_detail 非 0 状态，跳过', body, 'status=', r.status, 'message=', r.message);
+                continue;
+            }
+            const n = normalizeBillData(r.data);
+            if (n.ok && pickPublicEndDate(n.value) && pickPrice(n.value) != null) return n.value;
+            // 诊断信息（短）
+            const rawType = typeof r.data;
+            const rawLen = rawType === 'string' ? r.data.length
+                         : Array.isArray(r.data) ? r.data.length
+                         : (r.data && typeof r.data === 'object') ? Object.keys(r.data).length : 0;
+            const preview = n.preview || JSON.stringify(n.value || r.data).slice(0, 150);
+            lastPreview = { body, rawType, rawLen, preview };
+            log('bill_detail 字段不全，重试', body,
+                `(rawType=${rawType}, len=${rawLen})`,
+                '内容预览:', preview);
         }
-        throw new Error('bill_detail 取不到 publicEndDate/price，原始响应: ' + JSON.stringify(lastResp).slice(0, 300));
+        throw new Error('bill_detail 取不到 publicEndDate/price，最后预览: ' + JSON.stringify(lastPreview));
     }
     async function apiMyCollected(pageNum = 1, pageSize = 50) {
         const r = await callApi(EP.myCollected, { pageNum, pageSize });
@@ -626,12 +655,14 @@
     }
 
     // ====================== 控制台 & 油猴菜单 ======================
-    window.startSnipe = startSnipe;
-    window.cancelSnipe = cancelSnipe;
-    window.listSnipeTasks = listTasks;
-    window.pickFromCollections = pickFromCollections;
-    window.sniperSyncClock = activeSyncClock;
-    window.sniperAuth = () => getAuth();
+    // Tampermonkey 沙箱：写 window.x 在沙箱里，控制台访问不到；要写 unsafeWindow
+    const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    W.startSnipe = startSnipe;
+    W.cancelSnipe = cancelSnipe;
+    W.listSnipeTasks = listTasks;
+    W.pickFromCollections = pickFromCollections;
+    W.sniperSyncClock = activeSyncClock;
+    W.sniperAuth = () => getAuth();
 
     GM_registerMenuCommand('🎯 设为待抢（当前页/输入billId）', async () => {
         let billId = extractBillIdFromUrl();
