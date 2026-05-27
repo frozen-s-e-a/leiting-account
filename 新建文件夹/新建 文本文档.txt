@@ -244,6 +244,54 @@
         }
         return { ok: false, kind: typeof raw, preview: String(raw).slice(0, 200) };
     }
+    // 旧版接口（v2.1 时代）：可能仍可用，直接返回 price + publicEndDate
+    async function apiBillSimple(billId) {
+        try {
+            const r = await callApi('/api/sellbill/bill_simple', { billId });
+            if (r.status === 0) {
+                const n = normalizeBillData(r.data);
+                if (n.ok && pickPublicEndDate(n.value) && pickPrice(n.value) != null) {
+                    log('bill_simple 命中', billId);
+                    return n.value;
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    // DOM 兜底：FAB 用在详情页时，price 和 公示剩余时间 已经渲染在页面上
+    function scrapeBillFromDom(billId) {
+        if (extractBillIdFromUrl() !== billId) return null;
+        const text = (document.body && document.body.innerText) || '';
+        const priceMatch = text.match(/¥\s*([\d.]+)/);
+        const remStr = (text.match(/公示剩余时间[:：][^\n\r]+/) || [''])[0];
+        const dMatch = remStr.match(/(\d+)\s*天/);
+        const hMatch = remStr.match(/(\d+)\s*时/);
+        const mMatch = remStr.match(/(\d+)\s*分/);
+        const sMatch = remStr.match(/(\d+)\s*秒/);
+        if (!priceMatch || !(dMatch || hMatch || mMatch || sMatch)) {
+            log('DOM 兜底未匹配', { hasPrice: !!priceMatch, remStr: remStr.slice(0, 80) });
+            return null;
+        }
+        const dd = dMatch ? +dMatch[1] : 0;
+        const hh = hMatch ? +hMatch[1] : 0;
+        const mm = mMatch ? +mMatch[1] : 0;
+        const ss = sMatch ? +sMatch[1] : 0;
+        const remainMs = (((dd * 24 + hh) * 60 + mm) * 60 + ss) * 1000;
+        const endLocalMs = Date.now() + remainMs;
+        const pad = n => String(n).padStart(2, '0');
+        const bj = new Date(endLocalMs + 8 * 60 * 60 * 1000);
+        const publicEndDate = `${bj.getUTCFullYear()}-${pad(bj.getUTCMonth() + 1)}-${pad(bj.getUTCDate())} ${pad(bj.getUTCHours())}:${pad(bj.getUTCMinutes())}:${pad(bj.getUTCSeconds())}`;
+        let name = `账号 ${billId}`;
+        const candidates = document.querySelectorAll('h1, h2, .title, [class*="title"], [class*="name"]');
+        for (const el of candidates) {
+            const t = (el.innerText || '').trim();
+            if (t && t.length > 0 && t.length < 30 && !t.includes('¥')) { name = t; break; }
+        }
+        log('DOM 兜底命中', { price: +priceMatch[1], publicEndDate, name });
+        return { price: +priceMatch[1], publicEndDate, name, billId };
+    }
+
     async function apiBillDetail(billId) {
         const tries = [{ billId, part: 'basic' }, { billId, part: 'all' }, { billId }];
         let lastPreview = null;
@@ -507,8 +555,18 @@
         if (!auth) { alert('未检测到登录态，请先在网站登录并刷新一次页面'); return; }
         let d = seed;
         if (!d || !pickPublicEndDate(d) || pickPrice(d) == null) {
-            try { d = await apiBillDetail(billId); }
-            catch (e) { alert('获取账号详情失败：' + e.message); return; }
+            // 1) 旧接口 bill_simple（可能仍可用）
+            d = await apiBillSimple(billId);
+            // 2) DOM 兜底（FAB 用在详情页时数据已渲染）
+            if (!d) d = scrapeBillFromDom(billId);
+            // 3) 实在不行才试 bill_detail（绝大概率拿不到关键字段）
+            if (!d) {
+                try { d = await apiBillDetail(billId); }
+                catch (e) {
+                    alert('获取账号详情失败：' + e.message + '\n建议改从"📚 从收藏列表选择"入口设置');
+                    return;
+                }
+            }
         }
         const publicEndDate = pickPublicEndDate(d);
         const endTs = parseDateTs(publicEndDate);
