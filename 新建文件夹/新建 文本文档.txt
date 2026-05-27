@@ -1,0 +1,353 @@
+// ==UserScript==
+// @name         雷霆交易平台·账号抢购助手 v2.1
+// @namespace    user.leitinggame.sniper
+// @version      2.1.0
+// @description  公示期结束瞬间抢购指定账号；自动提取 billId；详情页悬浮按钮；收藏列表选择
+// @match        https://www.leitinggame.com.cn/*
+// @run-at       document-start
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @grant        GM_registerMenuCommand
+// @grant        GM_notification
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const API_BASE  = 'https://fortunaapi.leitinggame.com.cn';
+    const STORE_KEY = 'sniper_tasks';
+    const AUTH_KEY  = 'sniper_auth';
+
+    // ========== XHR 拦截器：采集登录凭据 ==========
+    const OrigXHR = window.XMLHttpRequest;
+    function PatchedXHR() {
+        const x = new OrigXHR();
+        const hdrs = {};
+        const _set = x.setRequestHeader.bind(x);
+        x.setRequestHeader = function (k, v) { hdrs[k] = v; _set(k, v); };
+        const _open = x.open.bind(x);
+        let _u;
+        x.open = function (m, u) { _u = u; _open.apply(x, arguments); };
+        const _send = x.send.bind(x);
+        x.send = function (body) {
+            x.addEventListener('loadend', () => {
+                if (_u && _u.includes('fortunaapi') && hdrs['WEB-LOGIN-TOKEN']) {
+                    GM_setValue(AUTH_KEY, {
+                        uid: hdrs['WEB-LOGIN-UID'],
+                        token: hdrs['WEB-LOGIN-TOKEN'],
+                        gameCode: hdrs['gameCode'] || 'xianP',
+                        ts: Date.now()
+                    });
+                }
+            });
+            _send(body);
+        };
+        return x;
+    }
+    PatchedXHR.prototype = OrigXHR.prototype;
+    window.XMLHttpRequest = PatchedXHR;
+
+    // ========== 接口封装 ==========
+    function callApi(path, body) {
+        return new Promise((resolve, reject) => {
+            const auth = GM_getValue(AUTH_KEY, null);
+            if (!auth || !auth.token) return reject(new Error('未登录，请先在网站登录并浏览任意页面'));
+            const xhr = new OrigXHR();
+            xhr.open('POST', API_BASE + path, true);
+            xhr.withCredentials = true;
+            xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.setRequestHeader('WEB-LOGIN-UID', auth.uid);
+            xhr.setRequestHeader('WEB-LOGIN-TOKEN', auth.token);
+            xhr.setRequestHeader('gameCode', auth.gameCode);
+            xhr.onload = () => { try { resolve(JSON.parse(xhr.responseText)); } catch (e) { reject(e); } };
+            xhr.onerror = () => reject(new Error('network'));
+            xhr.send(JSON.stringify(body));
+        });
+    }
+
+    // ========== 工具函数 ==========
+    function parseDateTs(s) { return new Date(s.replace(' ', 'T') + '+08:00').getTime(); }
+    function loadTasks() { return GM_getValue(STORE_KEY, {}); }
+    function saveTasks(t) { GM_setValue(STORE_KEY, t); }
+    function gotoProduct(billId) {
+        const target = '#/product-detail/' + billId;
+        if (!location.hash.includes(target)) location.hash = target;
+    }
+    function extractBillIdFromUrl() {
+        const m = location.hash.match(/product-detail\/([^/?#]+)/);
+        return m ? m[1] : null;
+    }
+    function clickBuyButton() {
+        const candidates = [...document.querySelectorAll('*')].filter(el =>
+            el.textContent && el.textContent.trim() === '立即购买' && el.children.length === 0
+        );
+        for (const el of candidates) {
+            const btn = el.closest('.button') || el;
+            const cls = btn.className || '';
+            if (/gray|disabled/i.test(cls)) continue;
+            btn.click();
+            return true;
+        }
+        return false;
+    }
+    function notify(title, body) {
+        try { GM_notification({ title, text: body, timeout: 10000 }); } catch (e) {}
+        console.log(`%c[Sniper] ${title}  ${body}`, 'color:red;font-size:16px;font-weight:bold');
+    }
+
+    // ========== 任务调度 ==========
+    const activeTimers = {};
+    function scheduleTask(billId, task) {
+        cancelScheduled(billId);
+        const T = activeTimers[billId] = { timers: [], intervals: [], status: 'scheduled' };
+        const endTs = task.endTs;
+        const remain = () => endTs - Date.now();
+
+        // ----- T-5 分钟：跳转 + 首检 -----
+        const t5min = remain() - 5 * 60 * 1000;
+        const t5minHandler = async () => {
+            console.log('[Sniper] ⏰ T-5min 跳转 + 检测');
+            gotoProduct(billId);
+            try {
+                const r = await callApi('/api/sellbill/bill_simple', { billId });
+                const cur = Number(r.data.price);
+                if (cur === Number(task.initialPrice)) {
+                    notify('⏰ 距开抢 5 分钟  价格未变',
+                           `${task.name} ¥${cur}\n请立即打开"我的钱包"通过短信验证解锁`);
+                    try { alert(`⏰ 距开抢 5 分钟\n${task.name} ¥${cur} 价格未变\n请立即输入验证码解锁钱包`); } catch (e) {}
+                    T.status = 't5min-ok';
+                } else {
+                    notify('⚠️ T-5min 价格已变更',
+                           `${task.name} ¥${task.initialPrice} → ¥${cur}\n等待 T-5s 最终判定`);
+                    T.status = 't5min-changed';
+                }
+            } catch (e) { console.warn('[Sniper] T-5min 异常', e); }
+        };
+        if (t5min > 0) T.timers.push(setTimeout(t5minHandler, t5min));
+        else if (remain() > 5000) t5minHandler();
+
+        // ----- T-5 秒：终检 -----
+        const t5s = remain() - 5 * 1000;
+        if (t5s > 0) {
+            T.timers.push(setTimeout(async () => {
+                try {
+                    const r = await callApi('/api/sellbill/bill_simple', { billId });
+                    const cur = Number(r.data.price);
+                    if (cur === Number(task.initialPrice)) {
+                        T.status = 'ready';
+                        console.log(`%c[Sniper] ✅ T-5s 通过 ¥${cur}，待命`, 'color:green;font-weight:bold');
+                        notify('✅ T-5s 校验通过', `${task.name} ¥${cur}，准备抢购`);
+                    } else {
+                        T.status = 'aborted-final-check';
+                        notify('❌ T-5s 校验失败  已中止', `${task.name} ¥${task.initialPrice} → ¥${cur}`);
+                        try { alert(`❌ T-5s 校验失败：¥${cur}\n已中止`); } catch (e) {}
+                    }
+                } catch (e) { console.warn('[Sniper] T-5s 异常', e); }
+            }, t5s));
+        }
+
+        // ----- T=0：3 秒内高频点击 -----
+        T.timers.push(setTimeout(() => {
+            if (T.status !== 'ready') {
+                console.log(`[Sniper] 状态 ${T.status}，跳过 T=0`);
+                return;
+            }
+            console.log('%c[Sniper] 🚀 开抢！', 'color:red;font-size:20px;font-weight:bold');
+            let attempts = 0;
+            const iv = setInterval(() => {
+                attempts++;
+                if (clickBuyButton()) {
+                    clearInterval(iv);
+                    T.status = 'clicked';
+                    T.intervals.forEach(clearInterval);
+                    notify('🎉 已点击购买', '请在 30 分钟内手动完成支付');
+                    const tasks = loadTasks();
+                    delete tasks[billId];
+                    saveTasks(tasks);
+                } else if (attempts >= 30) {
+                    clearInterval(iv);
+                    T.status = 'click-failed';
+                    notify('❌ 3 秒内未点击成功', '可能已被他人抢走');
+                    try { alert('❌ 3 秒内未能点击购买按钮'); } catch (e) {}
+                }
+            }, 100);
+            T.intervals.push(iv);
+        }, Math.max(0, remain())));
+
+        console.log(`[Sniper] ✅ 已部署 ${billId}（${task.name}） 倒计时 ${(remain() / 60000).toFixed(2)} 分钟`);
+    }
+
+    function cancelScheduled(billId) {
+        const T = activeTimers[billId];
+        if (T) { T.timers.forEach(clearTimeout); T.intervals.forEach(clearInterval); }
+        delete activeTimers[billId];
+    }
+
+    // ========== 对外 API ==========
+    async function startSnipe(billId) {
+        const info = await callApi('/api/sellbill/bill_simple', { billId });
+        if (info.status !== 0) { alert('获取商品失败: ' + info.message); return; }
+        const d = info.data;
+        const endTs = parseDateTs(d.publicEndDate);
+        if (endTs - Date.now() <= 0) { alert('公示期已结束'); return; }
+
+        const task = {
+            initialPrice: Number(d.price),
+            endTs,
+            name: d.name,
+            publicEndDate: d.publicEndDate
+        };
+        const tasks = loadTasks();
+        tasks[billId] = task;
+        saveTasks(tasks);
+        scheduleTask(billId, task);
+        alert(`✅ 已设为待抢账号\n${d.name}（${d.serverName}）\n初始价格：¥${d.price}\n开抢时间：${d.publicEndDate}`);
+    }
+
+    function cancelSnipe(billId) {
+        cancelScheduled(billId);
+        const tasks = loadTasks();
+        delete tasks[billId];
+        saveTasks(tasks);
+    }
+
+    function listTasks() {
+        const tasks = loadTasks();
+        const out = Object.entries(tasks).map(([id, t]) => ({
+            billId: id, name: t.name, initialPrice: t.initialPrice,
+            publicEndDate: t.publicEndDate,
+            remainMin: ((t.endTs - Date.now()) / 60000).toFixed(2),
+            status: activeTimers[id]?.status || 'pending'
+        }));
+        console.table(out);
+        return out;
+    }
+
+    // ========== 收藏列表选择器 ==========
+    async function pickFromCollections() {
+        let r;
+        try { r = await callApi('/sellbill/my_collected', { pageNum: 1, pageSize: 50 }); }
+        catch (e) { alert('拉取收藏失败：' + e.message); return; }
+        if (r.status !== 0) { alert('拉取收藏失败：' + r.message); return; }
+        const list = (r.data.list || []).filter(item => {
+            // 只显示公示期内、未售出、未失效的
+            const endTs = parseDateTs(item.publicEndDate);
+            return endTs > Date.now() && item.status === 1;
+        });
+        if (!list.length) { alert('收藏中没有处于公示期的可抢账号'); return; }
+        showCollectionPicker(list);
+    }
+
+    function showCollectionPicker(list) {
+        const oldPanel = document.getElementById('sniper-picker');
+        if (oldPanel) oldPanel.remove();
+
+        const panel = document.createElement('div');
+        panel.id = 'sniper-picker';
+        panel.style.cssText = `
+            position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+            width:480px;max-height:70vh;overflow:auto;
+            background:#fff;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.3);
+            z-index:999999;padding:16px;font-family:system-ui,sans-serif`;
+        const title = document.createElement('div');
+        title.innerHTML = `<b>选择待抢账号</b> <span style="float:right;cursor:pointer;color:#999" onclick="this.parentElement.parentElement.remove()">✕</span>`;
+        title.style.cssText = 'font-size:16px;margin-bottom:10px;border-bottom:1px solid #eee;padding-bottom:8px';
+        panel.appendChild(title);
+
+        list.forEach(item => {
+            const row = document.createElement('div');
+            row.style.cssText = 'padding:10px;border-bottom:1px solid #f0f0f0;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
+            row.onmouseover = () => row.style.background = '#f5f9ff';
+            row.onmouseout  = () => row.style.background = '';
+            const remain = ((parseDateTs(item.publicEndDate) - Date.now()) / 60000).toFixed(1);
+            row.innerHTML = `
+                <div>
+                    <div style="font-weight:bold">${item.name}</div>
+                    <div style="color:#999;font-size:12px">${item.serverName} · ¥${item.price} · 公示剩余 ${remain} 分</div>
+                </div>
+                <button style="background:#1890ff;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer">设为待抢</button>`;
+            row.onclick = async () => {
+                panel.remove();
+                try { await startSnipe(item.billId); } catch (e) { alert('错误: ' + e.message); }
+            };
+            panel.appendChild(row);
+        });
+        document.body.appendChild(panel);
+    }
+
+    // ========== 详情页悬浮按钮 ==========
+    function injectFloatingButton() {
+        const billId = extractBillIdFromUrl();
+        const existing = document.getElementById('sniper-fab');
+        if (!billId) { if (existing) existing.remove(); return; }
+        if (existing) return;
+        const fab = document.createElement('div');
+        fab.id = 'sniper-fab';
+        fab.textContent = '🎯 设为待抢';
+        fab.style.cssText = `
+            position:fixed;right:20px;bottom:90px;z-index:99999;
+            background:linear-gradient(135deg,#ff6a00,#ee0979);color:#fff;
+            padding:10px 16px;border-radius:24px;cursor:pointer;
+            box-shadow:0 4px 14px rgba(0,0,0,.25);font-weight:bold;font-size:14px;
+            user-select:none`;
+        fab.onclick = async () => {
+            const id = extractBillIdFromUrl();
+            if (!id) { alert('未识别 billId'); return; }
+            try { await startSnipe(id); } catch (e) { alert('错误: ' + e.message); }
+        };
+        document.body.appendChild(fab);
+    }
+    // 监听 hash 变化以便切换页面时显示/隐藏悬浮按钮
+    window.addEventListener('hashchange', injectFloatingButton);
+
+    // ========== 启动恢复 ==========
+    function restoreTasks() {
+        const tasks = loadTasks();
+        const now = Date.now();
+        let restored = 0, dropped = 0;
+        Object.entries(tasks).forEach(([billId, task]) => {
+            if (task.endTs - now < -60 * 1000) { delete tasks[billId]; dropped++; }
+            else if (!activeTimers[billId]) { scheduleTask(billId, task); restored++; }
+        });
+        if (dropped) saveTasks(tasks);
+        if (restored) console.log(`[Sniper] 已恢复 ${restored} 个任务`);
+    }
+
+    // 暴露给控制台
+    window.startSnipe = startSnipe;
+    window.cancelSnipe = cancelSnipe;
+    window.listSnipeTasks = listTasks;
+    window.pickFromCollections = pickFromCollections;
+
+    // 油猴菜单
+    GM_registerMenuCommand('🎯 设为待抢（当前页/输入billId）', async () => {
+        let billId = extractBillIdFromUrl();
+        if (!billId) billId = prompt('当前不在商品详情页，请手动输入 billId\n（或取消后改用菜单"从收藏列表选择"）');
+        if (!billId) return;
+        try { await startSnipe(billId.trim()); } catch (e) { alert('错误: ' + e.message); }
+    });
+    GM_registerMenuCommand('📚 从收藏列表选择', pickFromCollections);
+    GM_registerMenuCommand('📋 查看所有任务', listTasks);
+    GM_registerMenuCommand('❌ 取消某个任务', () => {
+        const billId = prompt('请输入要取消的 billId');
+        if (billId) cancelSnipe(billId.trim());
+    });
+    GM_registerMenuCommand('🗑 清空所有任务', () => {
+        if (confirm('确定清空所有抢购任务？')) {
+            Object.keys(loadTasks()).forEach(cancelScheduled);
+            saveTasks({});
+        }
+    });
+
+    function init() {
+        setTimeout(() => { restoreTasks(); injectFloatingButton(); }, 3000);
+        setInterval(() => { restoreTasks(); injectFloatingButton(); }, 5000);
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+    else init();
+
+    console.log('%c[雷霆抢购助手 v2.1] 已加载', 'color:purple;font-size:14px;font-weight:bold');
+})();
