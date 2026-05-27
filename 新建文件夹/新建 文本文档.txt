@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         雷霆交易平台·账号抢购助手 v2.1
+// @name         雷霆交易平台·账号抢购助手 v3.0
 // @namespace    user.leitinggame.sniper
-// @version      2.1.0
-// @description  公示期结束瞬间抢购指定账号；自动提取 billId；详情页悬浮按钮；收藏列表选择
+// @version      3.0.0
+// @description  公示期结束瞬间直接调 /buybill/buy 抢购；多源凭据；Worker 防限流；服务器校时；自动锁单
 // @match        https://www.leitinggame.com.cn/*
 // @run-at       document-start
 // @grant        GM_setValue
@@ -16,31 +16,91 @@
 (function () {
     'use strict';
 
-    const API_BASE  = 'https://fortunaapi.leitinggame.com.cn';
-    const STORE_KEY = 'sniper_tasks';
-    const AUTH_KEY  = 'sniper_auth';
+    // ====================== 常量 ======================
+    const API_BASE   = 'https://fortunaapi.leitinggame.com.cn';
+    const STORE_KEY  = 'sniper_tasks_v3';
+    const AUTH_KEY   = 'sniper_auth_v3';
+    const CLOCK_KEY  = 'sniper_clock_offset';        // 服务器时间 - 本地时间（毫秒）
+    const DEFAULT_PAY_TYPE = 2;                       // 1=支付宝 2=微信（按页面默认）
+    const ITYPE = 2;                                  // 抓包看到的固定值
 
-    // ========== XHR 拦截器：采集登录凭据 ==========
+    // 接口路径（按真实抓包整理，注意有无 /api 前缀不一致）
+    const EP = {
+        myCollected:   '/sellbill/my_collected',
+        billDetail:    '/api/sellbill/bill_detail',
+        getMyMoney:    '/user/get_my_money',
+        buyPrecheck:   '/buybill/precheck',
+        buyOrder:      '/buybill/buy',
+        buyLock:       '/buybill/lock',
+    };
+
+    // ====================== 工具 ======================
+    const log = (...a) => console.log('%c[Sniper]', 'color:#7c3aed;font-weight:bold', ...a);
+    const warn = (...a) => console.warn('[Sniper]', ...a);
+    const err = (...a) => console.error('[Sniper]', ...a);
+
+    function notify(title, body) {
+        try { GM_notification({ title, text: body, timeout: 10000 }); } catch (e) {}
+        log(`🔔 ${title} - ${body}`);
+    }
+    function getCookie(name) {
+        const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()[\]\\/+^])/g, '\\$1') + '=([^;]*)'));
+        return m ? decodeURIComponent(m[1]) : null;
+    }
+    function parseDateTs(s) {
+        // 形如 "2026-05-27 17:00:00" → 北京时间毫秒
+        return new Date(s.replace(' ', 'T') + '+08:00').getTime();
+    }
+    function nowServer() {
+        const off = Number(GM_getValue(CLOCK_KEY, 0)) || 0;
+        return Date.now() + off;
+    }
+
+    // ====================== 凭据多源采集 ======================
+    // 主源：ltl_formal_account cookie；兜底：拦截 XHR/fetch 请求头
+    function readAuthFromCookie() {
+        const raw = getCookie('ltl_formal_account');
+        if (!raw) return null;
+        try {
+            const j = JSON.parse(raw);
+            if (j && j.token && j.uid) {
+                return { uid: String(j.uid), token: String(j.token), gameCode: 'xianP', src: 'cookie', ts: Date.now() };
+            }
+        } catch (e) {}
+        return null;
+    }
+    function saveAuth(a) {
+        const prev = GM_getValue(AUTH_KEY, null) || {};
+        GM_setValue(AUTH_KEY, { ...prev, ...a, ts: Date.now() });
+    }
+    function getAuth() {
+        // 每次都尝试用 cookie 刷新（成本极低）
+        const cookieAuth = readAuthFromCookie();
+        if (cookieAuth) {
+            const cur = GM_getValue(AUTH_KEY, null);
+            if (!cur || cur.token !== cookieAuth.token || cur.uid !== cookieAuth.uid) {
+                saveAuth(cookieAuth);
+            }
+            return cookieAuth;
+        }
+        return GM_getValue(AUTH_KEY, null);
+    }
+
+    // ====================== 拦截 XHR + fetch ======================
     const OrigXHR = window.XMLHttpRequest;
     function PatchedXHR() {
         const x = new OrigXHR();
         const hdrs = {};
         const _set = x.setRequestHeader.bind(x);
-        x.setRequestHeader = function (k, v) { hdrs[k] = v; _set(k, v); };
+        x.setRequestHeader = function (k, v) { hdrs[k.toLowerCase()] = v; _set(k, v); };
         const _open = x.open.bind(x);
         let _u;
         x.open = function (m, u) { _u = u; _open.apply(x, arguments); };
         const _send = x.send.bind(x);
         x.send = function (body) {
             x.addEventListener('loadend', () => {
-                if (_u && _u.includes('fortunaapi') && hdrs['WEB-LOGIN-TOKEN']) {
-                    GM_setValue(AUTH_KEY, {
-                        uid: hdrs['WEB-LOGIN-UID'],
-                        token: hdrs['WEB-LOGIN-TOKEN'],
-                        gameCode: hdrs['gameCode'] || 'xianP',
-                        ts: Date.now()
-                    });
-                }
+                tryCaptureAuthFromHeaders(_u, hdrs);
+                tryCaptureClockFromResponse(x);
             });
             _send(body);
         };
@@ -49,162 +109,365 @@
     PatchedXHR.prototype = OrigXHR.prototype;
     window.XMLHttpRequest = PatchedXHR;
 
-    // ========== 接口封装 ==========
-    function callApi(path, body) {
+    const OrigFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        // 收集请求头
+        try {
+            let hdrs = {};
+            const h = (init && init.headers) || (typeof input !== 'string' && input.headers);
+            if (h) {
+                if (h instanceof Headers) h.forEach((v, k) => hdrs[k.toLowerCase()] = v);
+                else if (Array.isArray(h)) h.forEach(([k, v]) => hdrs[k.toLowerCase()] = v);
+                else Object.keys(h).forEach(k => hdrs[k.toLowerCase()] = h[k]);
+            }
+            const resp = await OrigFetch(input, init);
+            try {
+                tryCaptureAuthFromHeaders(url, hdrs);
+                tryCaptureClockFromFetchResponse(resp);
+            } catch (e) {}
+            return resp;
+        } catch (e) { throw e; }
+    };
+
+    function tryCaptureAuthFromHeaders(url, hdrs) {
+        if (!url || !url.includes('fortunaapi')) return;
+        const token = hdrs['web-login-token'];
+        const uid = hdrs['web-login-uid'];
+        const gc = hdrs['gamecode'] || hdrs['gameCode'.toLowerCase()];
+        if (token && uid) {
+            saveAuth({ uid, token, gameCode: gc || 'xianP', src: 'xhr' });
+        }
+    }
+
+    // ====================== 服务器时钟校准 ======================
+    function tryCaptureClockFromResponse(xhr) {
+        try {
+            const dateHdr = xhr.getResponseHeader('Date');
+            if (dateHdr) {
+                const serverMs = new Date(dateHdr).getTime();
+                if (!isNaN(serverMs)) {
+                    const offset = serverMs - Date.now();
+                    GM_setValue(CLOCK_KEY, offset);
+                }
+            }
+        } catch (e) {}
+    }
+    function tryCaptureClockFromFetchResponse(resp) {
+        try {
+            const dateHdr = resp.headers && resp.headers.get && resp.headers.get('date');
+            if (dateHdr) {
+                const serverMs = new Date(dateHdr).getTime();
+                if (!isNaN(serverMs)) {
+                    GM_setValue(CLOCK_KEY, serverMs - Date.now());
+                }
+            }
+        } catch (e) {}
+    }
+    async function activeSyncClock() {
+        // 主动校时：HEAD 一个不缓存的接口
+        try {
+            const resp = await OrigFetch(API_BASE + EP.getMyMoney, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: '',
+            });
+            const dateHdr = resp.headers.get('date');
+            if (dateHdr) {
+                const offset = new Date(dateHdr).getTime() - Date.now();
+                GM_setValue(CLOCK_KEY, offset);
+                log(`⏱ 校时完成，offset = ${offset} ms`);
+                return offset;
+            }
+        } catch (e) { warn('校时失败', e); }
+        return 0;
+    }
+
+    // ====================== API 封装 ======================
+    function callApi(path, body, opts = {}) {
         return new Promise((resolve, reject) => {
-            const auth = GM_getValue(AUTH_KEY, null);
-            if (!auth || !auth.token) return reject(new Error('未登录，请先在网站登录并浏览任意页面'));
+            const auth = getAuth();
+            if (!auth || !auth.token) return reject(new Error('未登录：未能从 cookie 或 XHR 中获取凭据，请先在网站完成登录'));
             const xhr = new OrigXHR();
             xhr.open('POST', API_BASE + path, true);
             xhr.withCredentials = true;
+            xhr.timeout = opts.timeout || 5000;
             xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
             xhr.setRequestHeader('Content-Type', 'application/json');
             xhr.setRequestHeader('WEB-LOGIN-UID', auth.uid);
             xhr.setRequestHeader('WEB-LOGIN-TOKEN', auth.token);
-            xhr.setRequestHeader('gameCode', auth.gameCode);
-            xhr.onload = () => { try { resolve(JSON.parse(xhr.responseText)); } catch (e) { reject(e); } };
-            xhr.onerror = () => reject(new Error('network'));
-            xhr.send(JSON.stringify(body));
+            xhr.setRequestHeader('gameCode', auth.gameCode || 'xianP');
+            xhr.onload = () => {
+                tryCaptureClockFromResponse(xhr);
+                try { resolve(JSON.parse(xhr.responseText)); }
+                catch (e) { reject(new Error('返回解析失败: ' + xhr.responseText?.slice(0, 200))); }
+            };
+            xhr.onerror = () => reject(new Error('network error'));
+            xhr.ontimeout = () => reject(new Error('timeout'));
+            xhr.send(body == null ? '' : JSON.stringify(body));
         });
     }
 
-    // ========== 工具函数 ==========
-    function parseDateTs(s) { return new Date(s.replace(' ', 'T') + '+08:00').getTime(); }
+    async function apiBillDetail(billId) {
+        const r = await callApi(EP.billDetail, { billId, part: 'basic' });
+        if (r.status !== 0) throw new Error(r.message || 'bill_detail 失败');
+        return r.data;
+    }
+    async function apiMyCollected(pageNum = 1, pageSize = 50) {
+        const r = await callApi(EP.myCollected, { pageNum, pageSize });
+        if (r.status !== 0) throw new Error(r.message || 'my_collected 失败');
+        return r.data;
+    }
+    async function apiPrecheck(billId) {
+        return callApi(EP.buyPrecheck, { billId, itype: ITYPE });
+    }
+    async function apiBuy(billId) {
+        return callApi(EP.buyOrder, { billId, itype: ITYPE }, { timeout: 4000 });
+    }
+    async function apiLock(billId, orderId, payType = DEFAULT_PAY_TYPE) {
+        return callApi(EP.buyLock, { billId, id: orderId, payType });
+    }
+
+    // ====================== 任务存取 ======================
     function loadTasks() { return GM_getValue(STORE_KEY, {}); }
     function saveTasks(t) { GM_setValue(STORE_KEY, t); }
-    function gotoProduct(billId) {
-        const target = '#/product-detail/' + billId;
-        if (!location.hash.includes(target)) location.hash = target;
+
+    // ====================== Worker 高精度计时器 ======================
+    // 在后台 tab 中 setTimeout 会被严重限流（>=1s）。Web Worker 不受 tab 可见性影响。
+    let timerWorker = null;
+    function ensureTimerWorker() {
+        if (timerWorker) return timerWorker;
+        const src = `
+            const tasks = new Map();
+            self.onmessage = (e) => {
+                const { id, type, delay } = e.data;
+                if (type === 'set') {
+                    const handle = setTimeout(() => {
+                        self.postMessage({ id, fire: true });
+                        tasks.delete(id);
+                    }, delay);
+                    tasks.set(id, handle);
+                } else if (type === 'clear') {
+                    const h = tasks.get(id);
+                    if (h) { clearTimeout(h); tasks.delete(id); }
+                } else if (type === 'tick') {
+                    // 高频心跳（每 ms 检查一次时间是否到达）
+                    const target = e.data.target;
+                    const taskId = id;
+                    const iv = setInterval(() => {
+                        if (Date.now() >= target) {
+                            self.postMessage({ id: taskId, fire: true });
+                            clearInterval(iv);
+                            tasks.delete(taskId);
+                        }
+                    }, 1);
+                    tasks.set(taskId, iv);
+                }
+            };
+        `;
+        const blob = new Blob([src], { type: 'application/javascript' });
+        timerWorker = new Worker(URL.createObjectURL(blob));
+        const callbacks = new Map();
+        timerWorker._callbacks = callbacks;
+        timerWorker.onmessage = (e) => {
+            const cb = callbacks.get(e.data.id);
+            if (cb) { callbacks.delete(e.data.id); cb(); }
+        };
+        return timerWorker;
     }
-    function extractBillIdFromUrl() {
-        const m = location.hash.match(/product-detail\/([^/?#]+)/);
-        return m ? m[1] : null;
+    function workerTimeout(delayMs, cb) {
+        const w = ensureTimerWorker();
+        const id = Math.random().toString(36).slice(2);
+        w._callbacks.set(id, cb);
+        w.postMessage({ id, type: 'set', delay: Math.max(0, delayMs) });
+        return id;
     }
-    function clickBuyButton() {
+    function workerTickUntil(targetLocalMs, cb) {
+        // targetLocalMs 是「本地时钟」上的目标时刻（已扣除服务器偏移）
+        const w = ensureTimerWorker();
+        const id = Math.random().toString(36).slice(2);
+        w._callbacks.set(id, cb);
+        w.postMessage({ id, type: 'tick', target: targetLocalMs });
+        return id;
+    }
+    function workerClear(id) {
+        const w = ensureTimerWorker();
+        w._callbacks.delete(id);
+        w.postMessage({ id, type: 'clear' });
+    }
+
+    // ====================== 抢购核心 ======================
+    const activeTimers = {};
+
+    async function fireBuy(billId, task) {
+        const t0 = performance.now();
+        log(`🚀 fire ${billId}`);
+        // 直接调 /buybill/buy（不通过 DOM 点击）
+        let r;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                r = await apiBuy(billId);
+                log(`buy 响应 #${attempt}`, r);
+                if (r.status === 0) break;
+                // 常见错误码下不再重试（已售出 / 已下架）
+                if (/已售|下架|不存在|失效/.test(r.message || '')) break;
+            } catch (e) {
+                warn(`buy 第 ${attempt} 次异常`, e);
+            }
+            await new Promise(r => setTimeout(r, 80));
+        }
+        const elapsed = (performance.now() - t0).toFixed(1);
+        if (!r || r.status !== 0) {
+            notify('❌ 抢购失败', `${task.name}：${r?.message || '未知错误'}（耗时 ${elapsed}ms）`);
+            // DOM 应急通道（万一 API 被风控）
+            tryDomClickFallback();
+            return;
+        }
+        const orderId = r.data?.id || r.data?.orderId || r.data?.buyId;
+        notify('🎉 抢购成功', `${task.name} 已下单（耗时 ${elapsed}ms），订单号 ${orderId}，30 分钟内付款`);
+        // 自动锁单（选择支付方式），让用户打开支付页就能直接付
+        if (orderId) {
+            try {
+                const lockResp = await apiLock(billId, orderId, DEFAULT_PAY_TYPE);
+                log('lock 响应', lockResp);
+            } catch (e) { warn('lock 异常', e); }
+            // 跳到订单详情/支付页
+            location.hash = `#/order-detail/${orderId}`;
+        }
+        // 任务完成清理
+        const tasks = loadTasks();
+        delete tasks[billId];
+        saveTasks(tasks);
+        cancelScheduled(billId);
+    }
+
+    function tryDomClickFallback() {
         const candidates = [...document.querySelectorAll('*')].filter(el =>
             el.textContent && el.textContent.trim() === '立即购买' && el.children.length === 0
         );
         for (const el of candidates) {
-            const btn = el.closest('.button') || el;
+            const btn = el.closest('.button') || el.closest('button') || el;
             const cls = btn.className || '';
-            if (/gray|disabled/i.test(cls)) continue;
-            btn.click();
-            return true;
+            if (/gray|disabled/i.test(cls) || btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+            try { btn.click(); log('DOM 兜底点击执行'); return true; } catch (e) {}
         }
         return false;
     }
-    function notify(title, body) {
-        try { GM_notification({ title, text: body, timeout: 10000 }); } catch (e) {}
-        console.log(`%c[Sniper] ${title}  ${body}`, 'color:red;font-size:16px;font-weight:bold');
+
+    function cancelScheduled(billId) {
+        const T = activeTimers[billId];
+        if (T) {
+            (T.timerIds || []).forEach(id => workerClear(id));
+            (T.localTimers || []).forEach(h => clearTimeout(h));
+        }
+        delete activeTimers[billId];
     }
 
-    // ========== 任务调度 ==========
-    const activeTimers = {};
     function scheduleTask(billId, task) {
         cancelScheduled(billId);
-        const T = activeTimers[billId] = { timers: [], intervals: [], status: 'scheduled' };
-        const endTs = task.endTs;
-        const remain = () => endTs - Date.now();
+        const T = activeTimers[billId] = { timerIds: [], localTimers: [], status: 'scheduled' };
 
-        // ----- T-5 分钟：跳转 + 首检 -----
+        // endTs 是「服务器时钟」上的目标
+        // 转成「本地时钟」上的目标 = endTs - clockOffset
+        const offset = Number(GM_getValue(CLOCK_KEY, 0)) || 0;
+        const targetLocal = task.endTs - offset;
+        const remain = () => targetLocal - Date.now();
+
+        // ----- T-5 分钟 -----
         const t5min = remain() - 5 * 60 * 1000;
         const t5minHandler = async () => {
-            console.log('[Sniper] ⏰ T-5min 跳转 + 检测');
-            gotoProduct(billId);
+            log('⏰ T-5min 触发');
             try {
-                const r = await callApi('/api/sellbill/bill_simple', { billId });
-                const cur = Number(r.data.price);
+                const d = await apiBillDetail(billId);
+                const cur = Number(d.price);
                 if (cur === Number(task.initialPrice)) {
                     notify('⏰ 距开抢 5 分钟  价格未变',
-                           `${task.name} ¥${cur}\n请立即打开"我的钱包"通过短信验证解锁`);
+                           `${task.name} ¥${cur}\n请立即"我的钱包"短信解锁`);
                     try { alert(`⏰ 距开抢 5 分钟\n${task.name} ¥${cur} 价格未变\n请立即输入验证码解锁钱包`); } catch (e) {}
                     T.status = 't5min-ok';
                 } else {
-                    notify('⚠️ T-5min 价格已变更',
-                           `${task.name} ¥${task.initialPrice} → ¥${cur}\n等待 T-5s 最终判定`);
+                    notify('⚠️ T-5min 价格变更', `${task.name} ¥${task.initialPrice} → ¥${cur}`);
                     T.status = 't5min-changed';
                 }
-            } catch (e) { console.warn('[Sniper] T-5min 异常', e); }
+            } catch (e) { warn('T-5min 异常', e); }
+            // 顺便再校一次时
+            activeSyncClock();
         };
-        if (t5min > 0) T.timers.push(setTimeout(t5minHandler, t5min));
+        if (t5min > 0) T.timerIds.push(workerTimeout(t5min, t5minHandler));
         else if (remain() > 5000) t5minHandler();
 
-        // ----- T-5 秒：终检 -----
+        // ----- T-5 秒 -----
         const t5s = remain() - 5 * 1000;
         if (t5s > 0) {
-            T.timers.push(setTimeout(async () => {
+            T.timerIds.push(workerTimeout(t5s, async () => {
                 try {
-                    const r = await callApi('/api/sellbill/bill_simple', { billId });
-                    const cur = Number(r.data.price);
+                    const d = await apiBillDetail(billId);
+                    const cur = Number(d.price);
                     if (cur === Number(task.initialPrice)) {
                         T.status = 'ready';
-                        console.log(`%c[Sniper] ✅ T-5s 通过 ¥${cur}，待命`, 'color:green;font-weight:bold');
                         notify('✅ T-5s 校验通过', `${task.name} ¥${cur}，准备抢购`);
                     } else {
                         T.status = 'aborted-final-check';
                         notify('❌ T-5s 校验失败  已中止', `${task.name} ¥${task.initialPrice} → ¥${cur}`);
                         try { alert(`❌ T-5s 校验失败：¥${cur}\n已中止`); } catch (e) {}
                     }
-                } catch (e) { console.warn('[Sniper] T-5s 异常', e); }
-            }, t5s));
+                } catch (e) { warn('T-5s 异常', e); }
+            }));
         }
 
-        // ----- T=0：3 秒内高频点击 -----
-        T.timers.push(setTimeout(() => {
-            if (T.status !== 'ready') {
-                console.log(`[Sniper] 状态 ${T.status}，跳过 T=0`);
+        // ----- T-1 秒：precheck 预热（暖管道）-----
+        const t1s = remain() - 1000;
+        if (t1s > 0) {
+            T.timerIds.push(workerTimeout(t1s, async () => {
+                try {
+                    const r = await apiPrecheck(billId);
+                    log('precheck', r);
+                } catch (e) { warn('precheck 异常', e); }
+            }));
+        }
+
+        // ----- T=0：高精度 tick → 直接 fireBuy -----
+        T.timerIds.push(workerTickUntil(targetLocal, () => {
+            if (T.status !== 'ready' && T.status !== 't5min-ok' && T.status !== 'scheduled') {
+                log(`状态 ${T.status}，跳过 T=0`);
                 return;
             }
-            console.log('%c[Sniper] 🚀 开抢！', 'color:red;font-size:20px;font-weight:bold');
-            let attempts = 0;
-            const iv = setInterval(() => {
-                attempts++;
-                if (clickBuyButton()) {
-                    clearInterval(iv);
-                    T.status = 'clicked';
-                    T.intervals.forEach(clearInterval);
-                    notify('🎉 已点击购买', '请在 30 分钟内手动完成支付');
-                    const tasks = loadTasks();
-                    delete tasks[billId];
-                    saveTasks(tasks);
-                } else if (attempts >= 30) {
-                    clearInterval(iv);
-                    T.status = 'click-failed';
-                    notify('❌ 3 秒内未点击成功', '可能已被他人抢走');
-                    try { alert('❌ 3 秒内未能点击购买按钮'); } catch (e) {}
-                }
-            }, 100);
-            T.intervals.push(iv);
-        }, Math.max(0, remain())));
+            T.status = 'firing';
+            fireBuy(billId, task);
+        }));
 
-        console.log(`[Sniper] ✅ 已部署 ${billId}（${task.name}） 倒计时 ${(remain() / 60000).toFixed(2)} 分钟`);
+        // 本地 setTimeout 作为最后兜底（Worker 万一挂了）
+        T.localTimers.push(setTimeout(() => {
+            if (T.status === 'firing' || T.status === 'clicked') return;
+            T.status = 'firing-fallback';
+            fireBuy(billId, task);
+        }, Math.max(0, remain() + 200)));
+
+        log(`✅ 已部署 ${billId}（${task.name}）剩余 ${(remain() / 60000).toFixed(2)} min，clockOffset=${offset}ms`);
     }
 
-    function cancelScheduled(billId) {
-        const T = activeTimers[billId];
-        if (T) { T.timers.forEach(clearTimeout); T.intervals.forEach(clearInterval); }
-        delete activeTimers[billId];
-    }
-
-    // ========== 对外 API ==========
+    // ====================== 对外 API ======================
     async function startSnipe(billId) {
-        const info = await callApi('/api/sellbill/bill_simple', { billId });
-        if (info.status !== 0) { alert('获取商品失败: ' + info.message); return; }
-        const d = info.data;
+        const auth = getAuth();
+        if (!auth) { alert('未检测到登录态，请先在网站登录并刷新一次页面'); return; }
+        const d = await apiBillDetail(billId);
         const endTs = parseDateTs(d.publicEndDate);
-        if (endTs - Date.now() <= 0) { alert('公示期已结束'); return; }
-
+        if (endTs - nowServer() <= 0) { alert('公示期已结束'); return; }
         const task = {
+            billId,
             initialPrice: Number(d.price),
             endTs,
-            name: d.name,
-            publicEndDate: d.publicEndDate
+            name: d.name || d.gameName || `账号 ${billId}`,
+            serverName: d.serverName || '',
+            publicEndDate: d.publicEndDate,
+            createdAt: Date.now(),
         };
         const tasks = loadTasks();
         tasks[billId] = task;
         saveTasks(tasks);
         scheduleTask(billId, task);
-        alert(`✅ 已设为待抢账号\n${d.name}（${d.serverName}）\n初始价格：¥${d.price}\n开抢时间：${d.publicEndDate}`);
+        alert(`✅ 已设为待抢账号\n${task.name}（${task.serverName}）\n初始价格：¥${task.initialPrice}\n开抢时间：${task.publicEndDate}`);
     }
 
     function cancelSnipe(billId) {
@@ -212,31 +475,32 @@
         const tasks = loadTasks();
         delete tasks[billId];
         saveTasks(tasks);
+        log('已取消', billId);
     }
 
     function listTasks() {
         const tasks = loadTasks();
+        const off = Number(GM_getValue(CLOCK_KEY, 0)) || 0;
         const out = Object.entries(tasks).map(([id, t]) => ({
             billId: id, name: t.name, initialPrice: t.initialPrice,
             publicEndDate: t.publicEndDate,
-            remainMin: ((t.endTs - Date.now()) / 60000).toFixed(2),
-            status: activeTimers[id]?.status || 'pending'
+            remainMin: ((t.endTs - nowServer()) / 60000).toFixed(2),
+            status: activeTimers[id]?.status || 'pending',
+            clockOffset: off,
         }));
         console.table(out);
         return out;
     }
 
-    // ========== 收藏列表选择器 ==========
+    // ====================== 收藏列表选择器 ======================
     async function pickFromCollections() {
-        let r;
-        try { r = await callApi('/sellbill/my_collected', { pageNum: 1, pageSize: 50 }); }
+        let data;
+        try { data = await apiMyCollected(1, 50); }
         catch (e) { alert('拉取收藏失败：' + e.message); return; }
-        if (r.status !== 0) { alert('拉取收藏失败：' + r.message); return; }
-        const list = (r.data.list || []).filter(item => {
-            // 只显示公示期内、未售出、未失效的
+        const list = (data.list || []).filter(item => {
             const endTs = parseDateTs(item.publicEndDate);
-            return endTs > Date.now() && item.status === 1;
-        });
+            return endTs > nowServer() && (item.status === 1 || item.status === undefined);
+        }).sort((a, b) => parseDateTs(a.publicEndDate) - parseDateTs(b.publicEndDate));
         if (!list.length) { alert('收藏中没有处于公示期的可抢账号'); return; }
         showCollectionPicker(list);
     }
@@ -249,36 +513,44 @@
         panel.id = 'sniper-picker';
         panel.style.cssText = `
             position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
-            width:480px;max-height:70vh;overflow:auto;
-            background:#fff;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.3);
-            z-index:999999;padding:16px;font-family:system-ui,sans-serif`;
-        const title = document.createElement('div');
-        title.innerHTML = `<b>选择待抢账号</b> <span style="float:right;cursor:pointer;color:#999" onclick="this.parentElement.parentElement.remove()">✕</span>`;
-        title.style.cssText = 'font-size:16px;margin-bottom:10px;border-bottom:1px solid #eee;padding-bottom:8px';
-        panel.appendChild(title);
+            width:520px;max-height:75vh;overflow:auto;
+            background:#fff;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.3);
+            z-index:999999;padding:18px;font-family:system-ui,sans-serif`;
+        panel.innerHTML = `
+            <div style="font-size:16px;margin-bottom:10px;border-bottom:1px solid #eee;padding-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+                <b>选择待抢账号</b>
+                <span style="cursor:pointer;color:#999;font-size:18px" data-close>✕</span>
+            </div>
+            <div id="sniper-list"></div>`;
+        panel.querySelector('[data-close]').onclick = () => panel.remove();
+        const listEl = panel.querySelector('#sniper-list');
 
         list.forEach(item => {
             const row = document.createElement('div');
             row.style.cssText = 'padding:10px;border-bottom:1px solid #f0f0f0;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
             row.onmouseover = () => row.style.background = '#f5f9ff';
             row.onmouseout  = () => row.style.background = '';
-            const remain = ((parseDateTs(item.publicEndDate) - Date.now()) / 60000).toFixed(1);
+            const remain = ((parseDateTs(item.publicEndDate) - nowServer()) / 60000).toFixed(1);
             row.innerHTML = `
                 <div>
-                    <div style="font-weight:bold">${item.name}</div>
-                    <div style="color:#999;font-size:12px">${item.serverName} · ¥${item.price} · 公示剩余 ${remain} 分</div>
+                    <div style="font-weight:bold">${item.name || item.gameName || item.billId}</div>
+                    <div style="color:#999;font-size:12px">${item.serverName || ''} · ¥${item.price} · 公示剩余 ${remain} 分</div>
                 </div>
                 <button style="background:#1890ff;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer">设为待抢</button>`;
             row.onclick = async () => {
                 panel.remove();
                 try { await startSnipe(item.billId); } catch (e) { alert('错误: ' + e.message); }
             };
-            panel.appendChild(row);
+            listEl.appendChild(row);
         });
         document.body.appendChild(panel);
     }
 
-    // ========== 详情页悬浮按钮 ==========
+    // ====================== 详情页悬浮按钮 ======================
+    function extractBillIdFromUrl() {
+        const m = location.hash.match(/product-detail\/([^/?#]+)/);
+        return m ? m[1] : null;
+    }
     function injectFloatingButton() {
         const billId = extractBillIdFromUrl();
         const existing = document.getElementById('sniper-fab');
@@ -300,37 +572,41 @@
         };
         document.body.appendChild(fab);
     }
-    // 监听 hash 变化以便切换页面时显示/隐藏悬浮按钮
     window.addEventListener('hashchange', injectFloatingButton);
 
-    // ========== 启动恢复 ==========
+    // ====================== 启动恢复 ======================
     function restoreTasks() {
         const tasks = loadTasks();
-        const now = Date.now();
+        const now = nowServer();
         let restored = 0, dropped = 0;
         Object.entries(tasks).forEach(([billId, task]) => {
             if (task.endTs - now < -60 * 1000) { delete tasks[billId]; dropped++; }
             else if (!activeTimers[billId]) { scheduleTask(billId, task); restored++; }
         });
         if (dropped) saveTasks(tasks);
-        if (restored) console.log(`[Sniper] 已恢复 ${restored} 个任务`);
+        if (restored) log(`已恢复 ${restored} 个任务`);
     }
 
-    // 暴露给控制台
+    // ====================== 控制台 & 油猴菜单 ======================
     window.startSnipe = startSnipe;
     window.cancelSnipe = cancelSnipe;
     window.listSnipeTasks = listTasks;
     window.pickFromCollections = pickFromCollections;
+    window.sniperSyncClock = activeSyncClock;
+    window.sniperAuth = () => getAuth();
 
-    // 油猴菜单
     GM_registerMenuCommand('🎯 设为待抢（当前页/输入billId）', async () => {
         let billId = extractBillIdFromUrl();
-        if (!billId) billId = prompt('当前不在商品详情页，请手动输入 billId\n（或取消后改用菜单"从收藏列表选择"）');
+        if (!billId) billId = prompt('当前不在商品详情页，请手动输入 billId\n（或取消后改用"从收藏列表选择"）');
         if (!billId) return;
         try { await startSnipe(billId.trim()); } catch (e) { alert('错误: ' + e.message); }
     });
     GM_registerMenuCommand('📚 从收藏列表选择', pickFromCollections);
     GM_registerMenuCommand('📋 查看所有任务', listTasks);
+    GM_registerMenuCommand('⏱ 立即与服务器校时', async () => {
+        const off = await activeSyncClock();
+        alert(`已校时，服务器与本地差 ${off} ms`);
+    });
     GM_registerMenuCommand('❌ 取消某个任务', () => {
         const billId = prompt('请输入要取消的 billId');
         if (billId) cancelSnipe(billId.trim());
@@ -343,11 +619,18 @@
     });
 
     function init() {
-        setTimeout(() => { restoreTasks(); injectFloatingButton(); }, 3000);
+        // 立刻尝试一次凭据采集
+        const a = getAuth();
+        if (a) log(`已加载凭据（来源 ${a.src}）uid=${a.uid}`);
+        else warn('暂未拿到凭据，请确保已登录并刷新页面');
+        // 主动校时
+        setTimeout(activeSyncClock, 1000);
+        // 任务恢复
+        setTimeout(() => { restoreTasks(); injectFloatingButton(); }, 2500);
         setInterval(() => { restoreTasks(); injectFloatingButton(); }, 5000);
     }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
     else init();
 
-    console.log('%c[雷霆抢购助手 v2.1] 已加载', 'color:purple;font-size:14px;font-weight:bold');
+    console.log('%c[雷霆抢购助手 v3.0] 已加载（API 直调模式）', 'color:purple;font-size:14px;font-weight:bold');
 })();
