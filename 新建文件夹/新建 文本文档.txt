@@ -48,8 +48,23 @@
         return m ? decodeURIComponent(m[1]) : null;
     }
     function parseDateTs(s) {
-        // 形如 "2026-05-27 17:00:00" → 北京时间毫秒
-        return new Date(s.replace(' ', 'T') + '+08:00').getTime();
+        // 形如 "2026-05-27 17:00:00" → 北京时间毫秒；缺失/异常时返回 NaN
+        if (!s || typeof s !== 'string') return NaN;
+        const t = new Date(s.replace(' ', 'T') + '+08:00').getTime();
+        return isNaN(t) ? NaN : t;
+    }
+    // 从异构响应中尽量找到公示结束时间字段
+    function pickPublicEndDate(obj) {
+        if (!obj) return null;
+        const keys = ['publicEndDate', 'publicEndTime', 'publicEnd', 'publicTime', 'publicEndAt'];
+        for (const k of keys) if (obj[k]) return obj[k];
+        return null;
+    }
+    function pickPrice(obj) {
+        if (!obj) return null;
+        const keys = ['price', 'currentPrice', 'sellPrice', 'salePrice'];
+        for (const k of keys) if (obj[k] != null) return Number(obj[k]);
+        return null;
     }
     function nowServer() {
         const off = Number(GM_getValue(CLOCK_KEY, 0)) || 0;
@@ -210,9 +225,19 @@
     }
 
     async function apiBillDetail(billId) {
-        const r = await callApi(EP.billDetail, { billId, part: 'basic' });
-        if (r.status !== 0) throw new Error(r.message || 'bill_detail 失败');
-        return r.data;
+        // 先用 basic（更轻），若没有公示时间字段则降级试 all / 不传 part
+        const tries = [{ billId, part: 'basic' }, { billId, part: 'all' }, { billId }];
+        let lastResp;
+        for (const body of tries) {
+            const r = await callApi(EP.billDetail, body);
+            lastResp = r;
+            if (r.status !== 0) continue;
+            const d = r.data || {};
+            if (pickPublicEndDate(d) && pickPrice(d) != null) return d;
+            // 字段不全，继续下一种 part
+            log('bill_detail 字段不全，重试', body, '响应 keys=', Object.keys(d));
+        }
+        throw new Error('bill_detail 取不到 publicEndDate/price，原始响应: ' + JSON.stringify(lastResp).slice(0, 300));
     }
     async function apiMyCollected(pageNum = 1, pageSize = 50) {
         const r = await callApi(EP.myCollected, { pageNum, pageSize });
@@ -380,7 +405,7 @@
             log('⏰ T-5min 触发');
             try {
                 const d = await apiBillDetail(billId);
-                const cur = Number(d.price);
+                const cur = pickPrice(d);
                 if (cur === Number(task.initialPrice)) {
                     notify('⏰ 距开抢 5 分钟  价格未变',
                            `${task.name} ¥${cur}\n请立即"我的钱包"短信解锁`);
@@ -403,7 +428,7 @@
             T.timerIds.push(workerTimeout(t5s, async () => {
                 try {
                     const d = await apiBillDetail(billId);
-                    const cur = Number(d.price);
+                    const cur = pickPrice(d);
                     if (cur === Number(task.initialPrice)) {
                         T.status = 'ready';
                         notify('✅ T-5s 校验通过', `${task.name} ¥${cur}，准备抢购`);
@@ -448,19 +473,25 @@
     }
 
     // ====================== 对外 API ======================
-    async function startSnipe(billId) {
+    async function startSnipe(billId, seed) {
         const auth = getAuth();
         if (!auth) { alert('未检测到登录态，请先在网站登录并刷新一次页面'); return; }
-        const d = await apiBillDetail(billId);
-        const endTs = parseDateTs(d.publicEndDate);
+        let d = seed;
+        if (!d || !pickPublicEndDate(d) || pickPrice(d) == null) {
+            try { d = await apiBillDetail(billId); }
+            catch (e) { alert('获取账号详情失败：' + e.message); return; }
+        }
+        const publicEndDate = pickPublicEndDate(d);
+        const endTs = parseDateTs(publicEndDate);
+        if (!endTs || isNaN(endTs)) { alert('未取到公示结束时间字段（请把控制台 [Sniper] 日志贴出来）'); return; }
         if (endTs - nowServer() <= 0) { alert('公示期已结束'); return; }
         const task = {
             billId,
-            initialPrice: Number(d.price),
+            initialPrice: pickPrice(d),
             endTs,
             name: d.name || d.gameName || `账号 ${billId}`,
             serverName: d.serverName || '',
-            publicEndDate: d.publicEndDate,
+            publicEndDate,
             createdAt: Date.now(),
         };
         const tasks = loadTasks();
@@ -497,10 +528,17 @@
         let data;
         try { data = await apiMyCollected(1, 50); }
         catch (e) { alert('拉取收藏失败：' + e.message); return; }
-        const list = (data.list || []).filter(item => {
-            const endTs = parseDateTs(item.publicEndDate);
+        const raw = data.list || data.records || data.items || [];
+        if (!raw.length) {
+            log('my_collected 响应 keys=', Object.keys(data));
+            alert('收藏列表返回空（响应结构未识别，已打印到控制台）');
+            return;
+        }
+        const list = raw.filter(item => {
+            const endTs = parseDateTs(pickPublicEndDate(item));
+            if (!endTs) return false;
             return endTs > nowServer() && (item.status === 1 || item.status === undefined);
-        }).sort((a, b) => parseDateTs(a.publicEndDate) - parseDateTs(b.publicEndDate));
+        }).sort((a, b) => parseDateTs(pickPublicEndDate(a)) - parseDateTs(pickPublicEndDate(b)));
         if (!list.length) { alert('收藏中没有处于公示期的可抢账号'); return; }
         showCollectionPicker(list);
     }
@@ -530,16 +568,16 @@
             row.style.cssText = 'padding:10px;border-bottom:1px solid #f0f0f0;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
             row.onmouseover = () => row.style.background = '#f5f9ff';
             row.onmouseout  = () => row.style.background = '';
-            const remain = ((parseDateTs(item.publicEndDate) - nowServer()) / 60000).toFixed(1);
+            const remain = ((parseDateTs(pickPublicEndDate(item)) - nowServer()) / 60000).toFixed(1);
             row.innerHTML = `
                 <div>
                     <div style="font-weight:bold">${item.name || item.gameName || item.billId}</div>
-                    <div style="color:#999;font-size:12px">${item.serverName || ''} · ¥${item.price} · 公示剩余 ${remain} 分</div>
+                    <div style="color:#999;font-size:12px">${item.serverName || ''} · ¥${pickPrice(item)} · 公示剩余 ${remain} 分</div>
                 </div>
                 <button style="background:#1890ff;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer">设为待抢</button>`;
             row.onclick = async () => {
                 panel.remove();
-                try { await startSnipe(item.billId); } catch (e) { alert('错误: ' + e.message); }
+                try { await startSnipe(item.billId, item); } catch (e) { alert('错误: ' + e.message); }
             };
             listEl.appendChild(row);
         });
