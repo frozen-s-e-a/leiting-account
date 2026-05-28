@@ -26,9 +26,14 @@
     const ITYPE = 2;                                  // 抓包看到的固定值
 
     // 接口路径（按真实抓包整理，注意有无 /api 前缀不一致）
+    // ⚠️ TODO: 前端 home.83e62e8a.js 反推显示 /buybill/lock 才是 "卡点抢购的核心接口
+    //          公示期一结束就调它"。但实际抓包 lock 是 buy 之后调用（且 lock 需要
+    //          buy 返回的 id）。这两种解读冲突，等首次真实抢号时验证。
     const EP = {
         myCollected:   '/sellbill/my_collected',
+        billSimple:    '/api/sellbill/bill_simple',
         billDetail:    '/api/sellbill/bill_detail',
+        checkPrice:    '/api/sellbill/check_price',
         getMyMoney:    '/user/get_my_money',
         buyPrecheck:   '/buybill/precheck',
         buyOrder:      '/buybill/buy',
@@ -244,10 +249,10 @@
         }
         return { ok: false, kind: typeof raw, preview: String(raw).slice(0, 200) };
     }
-    // 旧版接口（v2.1 时代）：可能仍可用，直接返回 price + publicEndDate
+    // bill_simple：返回 标题/价格/剩余时间/收藏量
     async function apiBillSimple(billId) {
         try {
-            const r = await callApi('/api/sellbill/bill_simple', { billId });
+            const r = await callApi(EP.billSimple, { billId });
             if (r.status === 0) {
                 const n = normalizeBillData(r.data);
                 if (n.ok && pickPublicEndDate(n.value) && pickPrice(n.value) != null) {
@@ -259,12 +264,49 @@
         return null;
     }
 
+    // check_price：抢购前检测账号是否改价（专用接口）
+    // 响应未知，兼容多种形态：
+    //  - {status:0, data:{price:500}}                → 服务器告诉我们当前价格
+    //  - {status:0}                                  → 仅 status，认为未改价
+    //  - {status:!0, message:"价格已变更"}           → 已改价
+    async function apiCheckPrice(billId) {
+        try {
+            const r = await callApi(EP.checkPrice, { billId });
+            if (r.status === 0) {
+                const n = normalizeBillData(r.data || {});
+                const p = n.ok ? pickPrice(n.value) : null;
+                if (p != null) return { price: p, unchanged: null, raw: r };
+                return { price: null, unchanged: true, raw: r };  // status:0 视为未改价
+            }
+            return { price: null, unchanged: false, message: r.message || '已改价', raw: r };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // 综合查询当前价格：check_price 优先，bill_simple 兜底
+    async function getCurrentPrice(billId, initialPrice) {
+        const cp = await apiCheckPrice(billId);
+        if (cp) {
+            if (cp.price != null) return { price: cp.price, source: 'check_price' };
+            if (cp.unchanged === true) return { price: Number(initialPrice), source: 'check_price-implicit', unchangedHint: true };
+            if (cp.unchanged === false) return { price: null, source: 'check_price', changedHint: true, message: cp.message };
+        }
+        const d = await apiBillSimple(billId);
+        if (d) {
+            const p = pickPrice(d);
+            if (p != null) return { price: p, source: 'bill_simple' };
+        }
+        return null;
+    }
+
     // DOM 兜底：FAB 用在详情页时，price 和 公示剩余时间 已经渲染在页面上
     function scrapeBillFromDom(billId) {
         if (extractBillIdFromUrl() !== billId) return null;
         const text = (document.body && document.body.innerText) || '';
         const priceMatch = text.match(/¥\s*([\d.]+)/);
-        const remStr = (text.match(/公示剩余时间[:：][^\n\r]+/) || [''])[0];
+        // 真实 DOM 里 "公示剩余时间:" 和后面的数字之间常有换行，因此用 [\s\S] 允许跨行
+        const remStr = (text.match(/公示剩余时间[:：][\s\S]{0,80}/) || [''])[0];
         const dMatch = remStr.match(/(\d+)\s*天/);
         const hMatch = remStr.match(/(\d+)\s*时/);
         const mMatch = remStr.match(/(\d+)\s*分/);
@@ -481,15 +523,20 @@
         const t5minHandler = async () => {
             log('⏰ T-5min 触发');
             try {
-                const d = await apiBillDetail(billId);
-                const cur = pickPrice(d);
-                if (cur === Number(task.initialPrice)) {
+                const r = await getCurrentPrice(billId, task.initialPrice);
+                if (!r) {
+                    warn('T-5min 取价失败，继续保持监控');
+                    T.status = 't5min-unknown';
+                } else if (r.changedHint) {
+                    notify('⚠️ T-5min 已改价（check_price）', `${task.name}：${r.message || ''}`);
+                    T.status = 't5min-changed';
+                } else if (r.price === Number(task.initialPrice) || r.unchangedHint) {
                     notify('⏰ 距开抢 5 分钟  价格未变',
-                           `${task.name} ¥${cur}\n请立即"我的钱包"短信解锁`);
-                    try { alert(`⏰ 距开抢 5 分钟\n${task.name} ¥${cur} 价格未变\n请立即输入验证码解锁钱包`); } catch (e) {}
+                           `${task.name} ¥${r.price}\n请立即"我的钱包"短信解锁`);
+                    try { alert(`⏰ 距开抢 5 分钟\n${task.name} ¥${r.price} 价格未变\n请立即输入验证码解锁钱包`); } catch (e) {}
                     T.status = 't5min-ok';
                 } else {
-                    notify('⚠️ T-5min 价格变更', `${task.name} ¥${task.initialPrice} → ¥${cur}`);
+                    notify('⚠️ T-5min 价格变更', `${task.name} ¥${task.initialPrice} → ¥${r.price}`);
                     T.status = 't5min-changed';
                 }
             } catch (e) { warn('T-5min 异常', e); }
@@ -504,15 +551,22 @@
         if (t5s > 0) {
             T.timerIds.push(workerTimeout(t5s, async () => {
                 try {
-                    const d = await apiBillDetail(billId);
-                    const cur = pickPrice(d);
-                    if (cur === Number(task.initialPrice)) {
+                    const r = await getCurrentPrice(billId, task.initialPrice);
+                    if (!r) {
+                        // 取价失败：不阻塞抢购（宁愿冒险点也比错过机会好）
                         T.status = 'ready';
-                        notify('✅ T-5s 校验通过', `${task.name} ¥${cur}，准备抢购`);
+                        notify('⚠️ T-5s 取价失败，仍尝试抢购', `${task.name}`);
+                    } else if (r.changedHint) {
+                        T.status = 'aborted-final-check';
+                        notify('❌ T-5s 已改价 已中止', `${task.name}：${r.message || ''}`);
+                        try { alert(`❌ T-5s 已改价\n${task.name}\n已中止`); } catch (e) {}
+                    } else if (r.price === Number(task.initialPrice) || r.unchangedHint) {
+                        T.status = 'ready';
+                        notify('✅ T-5s 校验通过', `${task.name} ¥${r.price}，准备抢购`);
                     } else {
                         T.status = 'aborted-final-check';
-                        notify('❌ T-5s 校验失败  已中止', `${task.name} ¥${task.initialPrice} → ¥${cur}`);
-                        try { alert(`❌ T-5s 校验失败：¥${cur}\n已中止`); } catch (e) {}
+                        notify('❌ T-5s 校验失败  已中止', `${task.name} ¥${task.initialPrice} → ¥${r.price}`);
+                        try { alert(`❌ T-5s 校验失败：¥${r.price}\n已中止`); } catch (e) {}
                     }
                 } catch (e) { warn('T-5s 异常', e); }
             }));
