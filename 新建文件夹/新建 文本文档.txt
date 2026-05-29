@@ -650,18 +650,125 @@
         log('已取消', billId);
     }
 
-    function listTasks() {
+    // 状态中文化
+    const STATUS_TEXT = {
+        scheduled: '⏳ 已部署，等待中',
+        't5min-ok': '🔓 距开抢5分钟，价格未变（请解锁钱包）',
+        't5min-changed': '⚠️ 距开抢5分钟，价格已变',
+        't5min-unknown': '❓ 5分钟检测取价失败',
+        ready: '✅ 校验通过，待命抢购',
+        firing: '🚀 正在抢购…',
+        'firing-fallback': '🚀 抢购中（兜底触发）',
+        'aborted-final-check': '❌ 终检改价，已中止',
+        clicked: '🎉 已下单',
+        pending: '⏳ 待恢复',
+    };
+
+    function buildTaskRows() {
         const tasks = loadTasks();
+        return Object.entries(tasks).map(([id, t]) => {
+            const remainMs = t.endTs - nowServer();
+            return {
+                billId: id,
+                name: t.name,
+                initialPrice: t.initialPrice,
+                publicEndDate: t.publicEndDate,
+                remainMs,
+                status: activeTimers[id]?.status || 'pending',
+            };
+        }).sort((a, b) => a.remainMs - b.remainMs);
+    }
+
+    function fmtRemain(ms) {
+        if (ms <= 0) return '已到点';
+        const s = Math.floor(ms / 1000);
+        const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+        const m = Math.floor((s % 3600) / 60), ss = s % 60;
+        const pad = n => String(n).padStart(2, '0');
+        if (d > 0) return `${d}天 ${pad(h)}:${pad(m)}:${pad(ss)}`;
+        return `${pad(h)}:${pad(m)}:${pad(ss)}`;
+    }
+
+    // 控制台用：仍返回数组 + console.table
+    function listTasks() {
+        const rows = buildTaskRows().map(r => ({ ...r, remain: fmtRemain(r.remainMs) }));
+        console.table(rows);
+        return rows;
+    }
+
+    // 可视化任务面板（带取消按钮、实时倒计时）
+    let taskPanelTimer = null;
+    function showTaskPanel() {
+        const old = document.getElementById('sniper-tasks-panel');
+        if (old) old.remove();
+        if (taskPanelTimer) { clearInterval(taskPanelTimer); taskPanelTimer = null; }
+
+        const panel = document.createElement('div');
+        panel.id = 'sniper-tasks-panel';
+        panel.style.cssText = `
+            position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+            width:560px;max-height:78vh;overflow:auto;
+            background:#fff;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.3);
+            z-index:999999;padding:18px;font-family:system-ui,sans-serif`;
+        panel.innerHTML = `
+            <div style="font-size:16px;margin-bottom:10px;border-bottom:1px solid #eee;padding-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+                <b>📋 抢购任务列表</b>
+                <span>
+                    <button data-clear style="background:#fff;color:#ff4d4f;border:1px solid #ff4d4f;padding:4px 10px;border-radius:4px;cursor:pointer;margin-right:8px;font-size:12px">清空全部</button>
+                    <span style="cursor:pointer;color:#999;font-size:18px" data-close>✕</span>
+                </span>
+            </div>
+            <div id="sniper-tasks-list"></div>`;
+        panel.querySelector('[data-close]').onclick = () => {
+            panel.remove();
+            if (taskPanelTimer) { clearInterval(taskPanelTimer); taskPanelTimer = null; }
+        };
+        panel.querySelector('[data-clear]').onclick = () => {
+            if (confirm('确定清空所有抢购任务？')) {
+                Object.keys(loadTasks()).forEach(cancelScheduled);
+                saveTasks({});
+                renderTaskRows(panel);
+            }
+        };
+        document.body.appendChild(panel);
+        renderTaskRows(panel);
+        // 每秒刷新倒计时与状态
+        taskPanelTimer = setInterval(() => {
+            if (!document.body.contains(panel)) { clearInterval(taskPanelTimer); taskPanelTimer = null; return; }
+            renderTaskRows(panel);
+        }, 1000);
+    }
+
+    function renderTaskRows(panel) {
+        const listEl = panel.querySelector('#sniper-tasks-list');
+        const rows = buildTaskRows();
         const off = Number(GM_getValue(CLOCK_KEY, 0)) || 0;
-        const out = Object.entries(tasks).map(([id, t]) => ({
-            billId: id, name: t.name, initialPrice: t.initialPrice,
-            publicEndDate: t.publicEndDate,
-            remainMin: ((t.endTs - nowServer()) / 60000).toFixed(2),
-            status: activeTimers[id]?.status || 'pending',
-            clockOffset: off,
-        }));
-        console.table(out);
-        return out;
+        if (!rows.length) {
+            listEl.innerHTML = `<div style="padding:24px;text-align:center;color:#999">暂无抢购任务<br><span style="font-size:12px">（用"📚 从收藏列表选择"或详情页🎯按钮添加）</span></div>`;
+            return;
+        }
+        listEl.innerHTML = `<div style="font-size:12px;color:#bbb;margin-bottom:6px">服务器校时偏差 ${off}ms · 共 ${rows.length} 个任务</div>`;
+        rows.forEach(r => {
+            const row = document.createElement('div');
+            row.style.cssText = 'padding:10px;border-bottom:1px solid #f0f0f0;display:flex;justify-content:space-between;align-items:center;gap:10px';
+            row.innerHTML = `
+                <div style="min-width:0;flex:1">
+                    <div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${r.name}</div>
+                    <div style="color:#999;font-size:12px">初始价 ¥${r.initialPrice} · 开抢 ${r.publicEndDate || '?'}</div>
+                    <div style="font-size:12px;margin-top:2px">${STATUS_TEXT[r.status] || r.status}</div>
+                </div>
+                <div style="text-align:right;white-space:nowrap">
+                    <div style="font-family:monospace;font-size:15px;color:${r.remainMs <= 0 ? '#ff4d4f' : (r.remainMs < 5 * 60000 ? '#fa8c16' : '#1890ff')}">${fmtRemain(r.remainMs)}</div>
+                    <button data-cancel="${r.billId}" style="margin-top:4px;background:#fff;color:#ff4d4f;border:1px solid #ff4d4f;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">取消</button>
+                </div>`;
+            row.querySelector('[data-cancel]').onclick = () => {
+                if (confirm(`取消抢购任务？\n${r.name}`)) {
+                    cancelSnipe(r.billId);
+                    renderTaskRows(panel);
+                }
+            };
+            listEl.appendChild(row);
+        });
     }
 
     // ====================== 收藏列表选择器 ======================
@@ -772,6 +879,7 @@
     W.startSnipe = startSnipe;
     W.cancelSnipe = cancelSnipe;
     W.listSnipeTasks = listTasks;
+    W.showTaskPanel = showTaskPanel;
     W.pickFromCollections = pickFromCollections;
     W.sniperSyncClock = activeSyncClock;
     W.sniperAuth = () => getAuth();
@@ -783,21 +891,13 @@
         try { await startSnipe(billId.trim()); } catch (e) { alert('错误: ' + e.message); }
     });
     GM_registerMenuCommand('📚 从收藏列表选择', pickFromCollections);
-    GM_registerMenuCommand('📋 查看所有任务', listTasks);
+    GM_registerMenuCommand('📋 查看所有任务', showTaskPanel);
     GM_registerMenuCommand('⏱ 立即与服务器校时', async () => {
         const off = await activeSyncClock();
         alert(`已校时，服务器与本地差 ${off} ms`);
     });
-    GM_registerMenuCommand('❌ 取消某个任务', () => {
-        const billId = prompt('请输入要取消的 billId');
-        if (billId) cancelSnipe(billId.trim());
-    });
-    GM_registerMenuCommand('🗑 清空所有任务', () => {
-        if (confirm('确定清空所有抢购任务？')) {
-            Object.keys(loadTasks()).forEach(cancelScheduled);
-            saveTasks({});
-        }
-    });
+    // 取消任务 / 清空任务 都统一到可视化面板里操作（带按钮）
+    GM_registerMenuCommand('❌ 取消 / 清空任务（打开面板）', showTaskPanel);
 
     function init() {
         // 立刻尝试一次凭据采集
