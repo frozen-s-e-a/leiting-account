@@ -1,8 +1,9 @@
 // ==UserScript==
-// @name         雷霆交易平台·账号抢购助手 v3.0
+// @name         雷霆交易平台·账号抢购助手
 // @namespace    user.leitinggame.sniper
-// @version      3.0.0
-// @description  公示期结束瞬间直接调 /buybill/buy 抢购；多源凭据；Worker 防限流；服务器校时；自动锁单
+// @version      3.1.0
+// @description  公示期结束瞬间直接调 /buybill/buy 抢购；多源凭据；Worker 防限流；服务器校时；可视化任务面板；自动更新
+// @author       leiting-account
 // @match        https://www.leitinggame.com.cn/*
 // @run-at       document-start
 // @grant        GM_setValue
@@ -12,6 +13,10 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
 // @grant        unsafeWindow
+// @homepageURL  https://github.com/frozen-s-e-a/leiting-account
+// @supportURL   https://github.com/frozen-s-e-a/leiting-account/issues
+// @updateURL    https://raw.githubusercontent.com/frozen-s-e-a/leiting-account/main/leiting-sniper.user.js
+// @downloadURL  https://raw.githubusercontent.com/frozen-s-e-a/leiting-account/main/leiting-sniper.user.js
 // ==/UserScript==
 
 (function () {
@@ -913,5 +918,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
     else init();
 
-    console.log('%c[雷霆抢购助手 v3.0] 已加载（API 直调模式）', 'color:purple;font-size:14px;font-weight:bold');
+    console.log('%c[雷霆抢购助手 v3.1] 已加载（API 直调模式 · 自动更新已启用）', 'color:purple;font-size:14px;font-weight:bold');
 })();
