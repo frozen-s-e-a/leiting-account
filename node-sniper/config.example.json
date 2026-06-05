@@ -1,0 +1,40 @@
+{
+  "_说明": "复制本文件为 config.json 后填写。config.json 已被 .gitignore 忽略，不会进仓库。",
+
+  "apiBase": "https://fortunaapi.leitinggame.com.cn",
+  "gameCode": "xianP",
+
+  "_凭据": "从浏览器 F12 → Network → 任一 fortunaapi 请求 → Copy as cURL 里抠出来。每次抢号前刷新。",
+  "cookie": "SESSION=粘贴你的; ltl_formal_account=粘贴你的",
+  "uid": "311950457572492762",
+  "token": "粘贴 web-login-token 的值",
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+
+  "_抢号目标": "bill = 账号 billId；fireAt = 公示期结束时间（北京时间）。fireAt 留空则尝试自动探测。",
+  "bill": "19e1a036bb5ahzv",
+  "fireAt": "2026-06-05 20:00:00",
+
+  "_下单参数": "itype/payType 照抓包填，一般不用改。autoLock=抢到后是否自动锁单。",
+  "itype": 2,
+  "payType": 2,
+  "autoLock": true,
+
+  "_时序微调": "fireLeadMs 留 null 则用实测 RTT 的一半（让请求刚好在开抢瞬间到达服务器）。",
+  "fireLeadMs": null,
+  "maxBuyAttempts": 4,
+
+  "_价格守门": "expectPrice 填则抢号前校验当前价；改价超过 priceTolerance 元则中止，防被钓鱼改价。留 null 关闭。",
+  "expectPrice": null,
+  "priceTolerance": 0,
+
+  "_邮件通知": "Gmail 需开两步验证并生成『应用专用密码』填到 pass。",
+  "email": {
+    "enabled": true,
+    "host": "smtp.gmail.com",
+    "port": 465,
+    "secure": true,
+    "user": "ysj957503@gmail.com",
+    "pass": "你的-gmail-应用专用密码",
+    "to": "ysj957503@gmail.com"
+  }
+}

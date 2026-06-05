@@ -1,0 +1,22 @@
+{
+  "name": "leiting-node-sniper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "雷霆交易平台账号抢购 - 服务器端 Node 版（公示期结束瞬间直调 /buybill/buy）",
+  "main": "sniper.js",
+  "bin": {
+    "sniper": "sniper.js"
+  },
+  "scripts": {
+    "check": "node sniper.js check",
+    "detail": "node sniper.js detail",
+    "snipe": "node sniper.js snipe",
+    "test-email": "node sniper.js test-email"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.0"
+  }
+}
