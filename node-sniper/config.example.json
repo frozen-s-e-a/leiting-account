@@ -4,7 +4,7 @@
   "apiBase": "https://fortunaapi.leitinggame.com.cn",
   "gameCode": "xianP",
 
-  "_凭据": "从浏览器 F12 → Network → 任一 fortunaapi 请求 → Copy as cURL 里抠出来。每次抢号前刷新。",
+  "_凭据": "从浏览器 F12 → Network → 任一 fortunaapi 请求 → Copy as cURL 里抠出来。只需搬一次(别点退出登录)；钱包解锁在开抢前 10 分钟内于浏览器单独完成,会自动同步到本会话。",
   "cookie": "SESSION=粘贴你的; ltl_formal_account=粘贴你的",
   "uid": "311950457572492762",
   "token": "粘贴 web-login-token 的值",

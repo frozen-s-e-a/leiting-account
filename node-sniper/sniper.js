@@ -107,6 +107,8 @@ function requestApi(pathname, bodyObj, opts = {}) {
         timeout: opts.timeout || 5000,
       },
       (res) => {
+        // 收到响应头的瞬间（Date 头此刻已到手）。校时用它做上界，排除 body 下载耗时。
+        const tHeaders = Date.now();
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
@@ -116,7 +118,7 @@ function requestApi(pathname, bodyObj, opts = {}) {
           const dateHeaderMs = dateHdr ? new Date(dateHdr).getTime() : NaN;
           let json = null;
           try { json = JSON.parse(raw); } catch (e) { /* 非 JSON */ }
-          resolve({ status: res.statusCode, json, raw, dateHeaderMs, t0, t1, rtt: t1 - t0 });
+          resolve({ status: res.statusCode, json, raw, dateHeaderMs, t0, tHeaders, t1, rtt: t1 - t0, ttfb: tHeaders - t0 });
         });
       }
     );
@@ -151,25 +153,31 @@ function fmtBeijing(ms) {
          `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}.${p(d.getUTCMilliseconds(), 3)}`;
 }
 
+// 心跳/校时探针：用 bill_detail（公开数据，不需要钱包解锁，随时可调）。
+function heartbeatProbe() {
+  if (CFG.bill) return requestApi(EP.billDetail, { billId: CFG.bill, part: 'basic' }, { timeout: 4000 });
+  return requestApi(EP.getMyMoney, null, { timeout: 4000 }); // 兜底
+}
+
 // ====================== 服务器校时 ======================
 // HTTP Date 头只有「秒」精度，单点采样最差会偏 1 秒。这里用区间交集法：
 // 每个样本给出 offset 的一个 [下界, 上界) 约束，多样本求交集把误差压到 ~RTT 量级。
-//   设服务器盖戳时刻 S，对应本地时刻在 [t0, t1]，offset = S - 本地。
+//   设服务器盖戳时刻 S，对应本地时刻在 [t0, tHeaders]（收到响应头那刻），offset = S - 本地。
 //   Date 头取整到秒得 serverSec，故 serverSec <= S < serverSec+1000。
-//   推得：  serverSec - t1  <=  offset  <  serverSec + 1000 - t0
+//   推得：  serverSec - tHeaders  <=  offset  <  serverSec + 1000 - t0
 async function syncClock(samples = 12) {
   let lower = -Infinity, upper = Infinity;
   let rttMin = Infinity;
   let got = 0;
   for (let i = 0; i < samples; i++) {
     try {
-      const r = await requestApi(EP.getMyMoney, null, { timeout: 4000 });
+      const r = await heartbeatProbe();
       if (!isNaN(r.dateHeaderMs)) {
-        const lo = r.dateHeaderMs - r.t1;
+        const lo = r.dateHeaderMs - r.tHeaders;
         const hi = r.dateHeaderMs + 1000 - r.t0;
         if (lo > lower) lower = lo;
         if (hi < upper) upper = hi;
-        rttMin = Math.min(rttMin, r.rtt);
+        rttMin = Math.min(rttMin, r.ttfb);
         got++;
       }
     } catch (e) { /* 单次失败忽略 */ }
@@ -317,6 +325,17 @@ async function doLock(billId, orderId) {
   }
 }
 
+// 钱包是否处于已解锁状态：探一次涉财接口 get_my_money。
+// status===0 → 已解锁；否则（"请先完成校验"等）→ 未解锁/已过期。
+async function walletUnlocked() {
+  try {
+    const r = await requestApi(EP.getMyMoney, null, { timeout: 4000 });
+    return { ok: !!(r.json && r.json.status === 0), message: r.json && r.json.message };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+}
+
 async function fire(billId) {
   const t0 = Date.now();
   log(`🚀 fire ${billId}`);
@@ -363,15 +382,24 @@ function spinFireAt(targetLocalMs, billId) {
 // ====================== 命令 ======================
 async function cmdCheck() {
   log('校验凭据 + 测速 + 校时…');
-  const r = await requestApi(EP.getMyMoney, null);
+  if (!CFG.bill) { warn('config 里没有 bill，校验将退化用 get_my_money（需钱包已解锁）'); }
+
+  // 1) 凭据有效性：用 bill_detail（公开数据，不需要解锁）
+  const r = await heartbeatProbe();
   if (!r.json) { errlog('响应非 JSON：', r.raw.slice(0, 200)); return; }
   if (r.json.status !== 0) {
     errlog(`凭据无效：status=${r.json.status} message=${r.json.message}`);
-    errlog('→ 多半是 cookie/token 过期，回浏览器重新复制。');
+    errlog('→ 多半是 cookie/token 过期或被登出，回浏览器重新复制 cookie。');
     return;
   }
-  const money = (r.json.data && (r.json.data.amount != null ? r.json.data.amount : JSON.stringify(r.json.data)));
-  log(`✅ 凭据有效。钱包：${money}`);
+  log('✅ 凭据有效（cookie 没过期、没登出）');
+
+  // 2) 钱包解锁状态：用 get_my_money 探一下
+  const w = await walletUnlocked();
+  if (w.ok) log('🔓 钱包当前已解锁，可立即抢号');
+  else log(`🔒 钱包当前未解锁（${w.message || ''}）—— 正常，开抢前 10 分钟内去浏览器解锁即可`);
+
+  // 3) 校时 + 测速
   const clk = await syncClock();
   log(`⏱ 校时 offset=${clk.offset}ms（精度±${Math.round(clk.precision / 2)}ms），最快 RTT=${clk.rttMin}ms`);
   log(`服务器当前时间约：${fmtBeijing(Date.now() + clk.offset)}`);
@@ -392,13 +420,13 @@ async function cmdTestEmail() {
 async function cmdSnipe() {
   if (!CFG.bill) { errlog('config 里没有 bill'); process.exit(1); }
 
-  // 1) 校验凭据
-  const chk = await requestApi(EP.getMyMoney, null);
+  // 1) 校验凭据（用 bill_detail，不需要钱包解锁；解锁留到开抢前由你在浏览器完成）
+  const chk = await heartbeatProbe();
   if (!chk.json || chk.json.status !== 0) {
-    errlog(`凭据无效：${chk.json ? chk.json.message : chk.raw.slice(0, 120)}。请刷新 cookie/token。`);
+    errlog(`凭据无效：${chk.json ? chk.json.message : chk.raw.slice(0, 120)}。请回浏览器重新复制 cookie（注意别点退出登录）。`);
     process.exit(1);
   }
-  log('✅ 凭据有效');
+  log('✅ 凭据有效（cookie 没过期）');
 
   // 2) 确定开抢时间
   let fireAt = parseBeijing(CFG.fireAt);
@@ -447,16 +475,37 @@ async function cmdSnipe() {
     }, checkAt);
   }
 
-  // 5) 连接预热：最后 30s 每 3s 发一次轻请求，保持 socket 热 + 持续校时
+  // 5) 解锁看守：开抢前若钱包还锁着，buy 必失败。在 T-8min / T-3min / T-1min 探测，
+  //    锁着就发邮件催你去浏览器解锁（解锁绑同一 SESSION，浏览器解锁后 ECS 自动也解锁）。
+  let unlockNagged = false;
+  for (const lead2 of [8 * 60000, 3 * 60000, 60000]) {
+    const at = remain - lead2;
+    if (at <= 0) continue;
+    setTimeout(async () => {
+      const w = await walletUnlocked();
+      if (w.ok) { log(`🔓 钱包已解锁（剩 ${(lead2 / 60000)}min）就绪`); }
+      else {
+        warn(`🔒 钱包未解锁（剩 ${(lead2 / 60000)}min）：${w.message || ''} —— 快去浏览器解锁！`);
+        if (!unlockNagged) {
+          unlockNagged = true;
+          sendMail('🔒 雷霆抢号提醒：钱包未解锁',
+            `距开抢约 ${(lead2 / 60000)} 分钟，钱包还锁着，buy 会失败！\n` +
+            `请立刻在浏览器解锁钱包（输支付密码）。billId=${CFG.bill}\n开抢：${fmtBeijing(fireAt)}`);
+        }
+      }
+    }, at);
+  }
+
+  // 6) 连接预热：最后 30s 每 3s 发一次 bill_detail，保持 socket 热 + 持续校时
   const warmStart = Math.max(0, remain - 30000);
   setTimeout(function warmLoop() {
     const left = targetLocal - Date.now();
     if (left <= 200) return;
-    requestApi(EP.getMyMoney, null).catch(() => {});
+    heartbeatProbe().catch(() => {});
     setTimeout(warmLoop, 3000);
   }, warmStart);
 
-  // 6) 引爆
+  // 7) 引爆
   log('部署完成，等待引爆…（Ctrl-C 取消）');
   await spinFireAt(targetLocal, CFG.bill);
 }
