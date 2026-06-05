@@ -104,16 +104,22 @@ T-10min 内  ① 浏览器解锁钱包(输支付密码)
 
 ## 桥接模式:浏览器一键下发(推荐,免手动搬数据)
 
-`bridge.js` 是常驻 ECS 的守护进程;浏览器用户脚本(v3.2+)把凭据/任务自动推过来。
-选号、登录、过验证、解锁都在浏览器(熟悉的界面),扣扳机在 ECS。
+两层进程:`bridge.js` 常驻只负责监听端口 + 派活;真正抢号在按需 `worker.js`(每任务一个,
+抢完自退)。选号/登录/过验证/解锁都在浏览器,扣扳机在 ECS。
 
 ```
-浏览器(用户脚本)                         ECS(bridge.js 守护)
-  登录后 → 自动 POST /sync(凭据) ───────────►  存入内存
-  解锁钱包 → 自动 POST /sync(凭据) ──────────►  热更新(确保拿到解锁后的 cookie)
-  详情页点「🚀 下发到服务器抢号」→ POST /task ─►  部署抢号,到点引爆 → 邮件
-                                            抢完无任务 → 空闲 40 分钟自动退出
+浏览器(用户脚本 v3.2+)                  ECS
+  登录后  → 自动 POST /sync ───────►  bridge(常驻) → 写 .creds.json
+  解锁钱包 → 自动 POST /sync ──────►  bridge        → 更新 .creds.json
+  点「🚀下发」→ POST /task ────────►  bridge spawn ─► worker(按需)
+                                                      读+监听 .creds.json
+                                                      校时→预热→引爆→邮件
+                                                      抢完 taskLingerMin 分钟后自退
 ```
+
+- **bridge**:永不退,始终监听(配 systemd 常驻,见下)
+- **worker**:按需生灭,崩了不影响 bridge 和其它任务
+- **.creds.json**:两者共享凭据的文件(bridge 写、worker 读+热加载),已 gitignore、权限 600
 
 ### 服务端启动
 
