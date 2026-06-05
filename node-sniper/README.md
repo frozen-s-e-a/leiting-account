@@ -159,11 +159,34 @@ ssh -L 8787:localhost:8787 root@你的ECS_IP
 `http://localhost:8787`。ECS 端口不公开,流量加密。代价:同步时家里要挂着这条命令
 (抢号本身不需要,ECS 自己会打)。
 
-### 开机自启 / 按需唤醒(可选)
+### 进程常驻
 
-- 简单常驻:`pm2 start bridge.js --name sniper-bridge` 或写个 systemd service
-- 真正「按需启动、空闲退出」:用 **systemd socket 激活**(systemd 替你监听端口,
-  来请求才拉起进程,空闲退出后下次请求再拉起)。需要时我可以给你 `.socket` / `.service` 模板。
+挑一个适合你的:
+
+**(a) systemd 常驻服务(推荐,一键)**
+
+```bash
+cd node-sniper
+sudo bash systemd/install.sh
+```
+
+会自动:`npm install --omit=dev` → 生成 unit 文件 → 注册 → 开机自启 → 立刻启动 → 崩了自动重启。
+日志:`journalctl -u sniper-bridge -f`。修改代码后:`sudo systemctl restart sniper-bridge`。
+
+**(b) 临时跑(关闭终端会断)**
+
+```bash
+node bridge.js
+```
+
+**(c) 后台跑(终端关了也不停,但开机不自启、崩了不重启)**
+
+```bash
+nohup node bridge.js > bridge.log 2>&1 &
+```
+
+> 推荐 (a)。bridge 闲置内存 ~60MB,2C2G 完全无感。配合 `idleShutdownMin: 0`(永不自退)
+> 即可"永远有人监听"。`idleShutdownMin > 0` 仅适合手动一次性跑 (b)。
 
 ## 关键设计
 

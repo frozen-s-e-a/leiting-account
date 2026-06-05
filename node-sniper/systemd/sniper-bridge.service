@@ -1,0 +1,26 @@
+# 雷霆抢号桥接守护(普通常驻服务,非 socket 激活)
+#
+# 安装(__INSTALL_DIR__、__NODE__ 由 install.sh 自动替换):
+#   sudo bash systemd/install.sh
+# 然后:
+#   sudo systemctl status sniper-bridge       查看状态
+#   sudo systemctl restart sniper-bridge      改完代码重启
+#   journalctl -u sniper-bridge -f            实时看日志
+[Unit]
+Description=Leiting account sniper bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__NODE__ __INSTALL_DIR__/bridge.js
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+# 给 Node 限个内存上限,防止万一漏内存把 2G ECS 吃光
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
