@@ -22,10 +22,10 @@
 ### 钱包解锁(整个方案的核心约束)
 
 - 抢号前必须在浏览器里**解锁钱包**(输一次支付密码)
-- 解锁状态绑在 **SESSION** 上、**不绑设备/IP**,且只维持 **~10 分钟**
-- 因此:**cookie 只需搬一次到服务器**。开抢前 10 分钟内你在浏览器解锁,
-  ECS 用的是同一个 SESSION,**自动也变成已解锁**,无需重新搬数据
-- 所以校验/心跳/校时一律用 `bill_detail`(不需要解锁),只有 `buy` 那一下需要解锁
+- 解锁状态只维持 **~10 分钟**
+- **不赌"解锁自动同步到服务器"**:解锁时浏览器可能种新 cookie。稳妥做法是
+  **解锁后把当下完整凭据再同步一次到服务器**(用 `node sniper.js paste`)
+- 校验/心跳/校时一律用 `bill_detail`(不需要解锁),只有 `buy` 那一下需要解锁
 
 ### 不要点「退出登录」
 
@@ -59,26 +59,38 @@ vi config.json                   # 填 cookie / token / bill / fireAt / 邮箱
 ## 用法
 
 ```bash
-node sniper.js check        # 校验凭据 + 看钱包 + 测 RTT + 看校时偏差
+node sniper.js check        # 校验凭据 + 看钱包解锁状态 + 测 RTT + 看校时偏差
 node sniper.js detail       # 拉 bill_detail,尝试探测公示结束时间/价格
 node sniper.js test-email   # 发测试邮件,确认通知通道
 node sniper.js snipe        # 正式部署抢号(默认命令)
+node sniper.js paste        # 从浏览器 Copy as cURL 更新凭据(贴完 Ctrl-D)
+node sniper.js paste a.curl # 也可从文件读
 
 # 命令行覆盖 config:
 node sniper.js snipe --bill 19e1a036bb5ahzv --at "2026-06-05 20:00:00"
 ```
 
+### `paste`:解锁后一键重贴凭据
+
+`snipe` 运行时会监听 `config.json`。解锁钱包后:
+
+1. 浏览器 F12 → Network → 任一 `fortunaapi` 请求 → **Copy as cURL (bash)**
+2. 服务器上 `node sniper.js paste`,把整段粘上,Ctrl-D
+3. 自动抠出 cookie/uid/token 写进 config → 正在跑的 `snipe` **1~2 秒内热加载**(不重启、不丢校时)
+
 ## 抢号流程(实操)
 
-cookie 可以**提前任意时间**搬到服务器并启动 `snipe`;**解锁只需在开抢前 10 分钟内做一次**。
+cookie 可**提前任意时间**搬到服务器并启动 `snipe`;**解锁 + 重贴凭据在开抢前 10 分钟内做一次**。
 
 ```
 任意时刻  浏览器登录 → F12 复制 cURL → 填 ECS 上 config.json → node sniper.js snipe
-         (脚本开始用 bill_detail 心跳/校时,挂着等;此时不需要解锁)
+         (脚本用 bill_detail 心跳/校时,挂着等;此时不需要解锁)
          浏览器可以关掉(但别点退出登录)
 
 T-8/3/1min  脚本探测钱包是否解锁,若没解锁 → 发邮件催你
-T-10min 内  浏览器解锁钱包(输支付密码)—— 同一 SESSION,ECS 自动也解锁
+T-10min 内  ① 浏览器解锁钱包(输支付密码)
+            ② 浏览器 Copy as cURL → 服务器 node sniper.js paste(重贴当下完整凭据)
+            → 正在跑的 snipe 热加载,确保拿到的是解锁后的最新 cookie
          ├─ T-30s 起每 3s 预热连接 + 持续校时
          ├─ (可选)T-8s 价格守门,改价超容差则中止
          └─ T=0   忙等到点,引爆 /buybill/buy → 成功则 lock → 发邮件

@@ -55,6 +55,53 @@ function loadConfig() {
   return cfg;
 }
 
+// ====================== 凭据：从 cURL 解析 / 写回 / 热加载 ======================
+// 解析浏览器「Copy as cURL (bash)」整段，抠出 cookie / uid / token / UA。
+function parseCurl(text) {
+  const out = {};
+  const pick = (re) => { const m = text.match(re); return m ? m[1].trim() : null; };
+  // cookie：-b '...' 或 --cookie '...' 或 -H 'cookie: ...'
+  out.cookie = pick(/(?:-b|--cookie)\s+'([^']*)'/i) || pick(/-H\s+'cookie:\s*([^']*)'/i);
+  out.token = pick(/-H\s+'web-login-token:\s*([^']*)'/i);
+  out.uid = pick(/-H\s+'web-login-uid:\s*([^']*)'/i);
+  out.userAgent = pick(/-H\s+'user-agent:\s*([^']*)'/i);
+  // uid 兜底：从 cookie 里的 ltl_formal_account 解出来
+  if (!out.uid && out.cookie) {
+    const m = out.cookie.match(/ltl_formal_account=([^;]+)/);
+    if (m) {
+      try {
+        const j = JSON.parse(decodeURIComponent(m[1]));
+        if (j.uid) out.uid = String(j.uid);
+        if (!out.token && j.token) out.token = String(j.token);
+      } catch (e) { /* ignore */ }
+    }
+  }
+  // 清掉空值
+  Object.keys(out).forEach((k) => { if (!out[k]) delete out[k]; });
+  return out;
+}
+
+// 把凭据字段合并写回 config.json（保留其它字段）
+function saveCredsToConfig(creds) {
+  const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  Object.assign(cfg, creds);
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+}
+
+const mask = (s) => (s && s.length > 12 ? s.slice(0, 6) + '***' + s.slice(-4) : (s ? '***' : '(空)'));
+
+// 运行中热加载：仅刷新凭据字段，不动已部署的计划/校时
+function reloadCreds() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    let changed = false;
+    for (const k of ['cookie', 'token', 'uid', 'userAgent']) {
+      if (cfg[k] && cfg[k] !== CFG[k]) { CFG[k] = cfg[k]; changed = true; }
+    }
+    if (changed) log(`🔄 凭据已热更新（cookie=${mask(CFG.cookie)}）`);
+  } catch (e) { /* 文件可能正写到一半，忽略本次 */ }
+}
+
 // ====================== 日志 ======================
 function ts() {
   const d = new Date(Date.now() + 8 * 3600 * 1000); // 北京时间显示
@@ -417,6 +464,33 @@ async function cmdTestEmail() {
   await sendMail('✅ 雷霆抢号机测试邮件', `这是一封测试邮件。\n时间：${fmtBeijing(Date.now())}`);
 }
 
+// 从 cURL 更新凭据：`node sniper.js paste [文件]`，无文件则读 stdin。
+// 解锁钱包后在浏览器 Copy as cURL，到服务器贴进来即可（正在跑的 snipe 会热加载）。
+async function cmdPaste() {
+  const fileArg = process.argv[3];
+  let text;
+  if (fileArg && fs.existsSync(fileArg)) {
+    text = fs.readFileSync(fileArg, 'utf8');
+  } else {
+    process.stdin.setEncoding('utf8');
+    if (process.stdin.isTTY) console.log('粘贴浏览器 Copy as cURL 的整段，然后回车按 Ctrl-D 结束：');
+    text = await new Promise((resolve) => {
+      let buf = '';
+      process.stdin.on('data', (d) => (buf += d));
+      process.stdin.on('end', () => resolve(buf));
+    });
+  }
+  const creds = parseCurl(text);
+  if (!creds.cookie && !creds.token) {
+    errlog('没解析到 cookie/token。请确认贴的是「Copy as cURL (bash)」的完整内容。');
+    process.exit(1);
+  }
+  saveCredsToConfig(creds);
+  log('✅ 已更新凭据 → config.json');
+  log(`   cookie=${mask(creds.cookie)}  uid=${creds.uid || '(未变)'}  token=${mask(creds.token)}`);
+  log('   若 snipe 正在运行，它会在 1~2 秒内自动热加载。');
+}
+
 async function cmdSnipe() {
   if (!CFG.bill) { errlog('config 里没有 bill'); process.exit(1); }
 
@@ -427,6 +501,10 @@ async function cmdSnipe() {
     process.exit(1);
   }
   log('✅ 凭据有效（cookie 没过期）');
+
+  // 监听 config.json：解锁后用 `node sniper.js paste` 重贴凭据，这里热加载，不必重启
+  fs.watchFile(CONFIG_PATH, { interval: 1000 }, reloadCreds);
+  log('👀 已监听 config.json，解锁后 `node sniper.js paste` 重贴凭据会自动热加载');
 
   // 2) 确定开抢时间
   let fireAt = parseBeijing(CFG.fireAt);
@@ -518,8 +596,9 @@ async function cmdSnipe() {
     if (cmd === 'check') await cmdCheck();
     else if (cmd === 'detail') await cmdDetail();
     else if (cmd === 'test-email') await cmdTestEmail();
+    else if (cmd === 'paste') await cmdPaste();
     else if (cmd === 'snipe') await cmdSnipe();
-    else { console.error(`未知命令：${cmd}（可用：check | detail | snipe | test-email）`); process.exit(1); }
+    else { console.error(`未知命令：${cmd}（可用：check | detail | snipe | paste | test-email）`); process.exit(1); }
   } catch (e) {
     errlog('致命错误：', e && e.stack ? e.stack : e);
     process.exit(1);
