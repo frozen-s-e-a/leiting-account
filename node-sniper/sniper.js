@@ -2,595 +2,136 @@
 'use strict';
 
 /*
- * 雷霆交易平台 · 账号抢购（服务器端 Node 版）
- * ------------------------------------------------------------------
- * 移植自浏览器用户脚本 leiting-sniper.user.js v3.1，去掉 DOM / 油猴依赖，
- * 改为在 ECS 上用 keep-alive 长连接直调 /buybill/buy，公示期结束瞬间引爆。
+ * 雷霆抢号 CLI（命令行单机版）。重逻辑都在 core.js。
  *
- * 抢号前置（务必）：先在浏览器里登录并「解锁钱包」（输一次支付密码），
- * 解锁状态绑定在 SESSION cookie 上。然后把 cookie/token 填进 config.json，
- * 趁解锁未过期（一般 5~30 分钟）启动本脚本。
+ * 抢号前置:先在浏览器登录并「解锁钱包」(输支付密码),解锁状态绑在 SESSION 上、
+ * 只活 ~10 分钟。把 cookie/token 填进 config.json(或用 paste 命令),趁解锁有效启动。
  *
- * 用法：
- *   node sniper.js check        校验凭据 / 看钱包 / 测 RTT / 看校时偏差
- *   node sniper.js detail       拉 bill_detail，尝试探测公示结束时间与价格
- *   node sniper.js snipe        部署抢号（默认命令）
- *   node sniper.js test-email   发一封测试邮件
- *
- * 凭据与密钥只放在 config.json（已被 .gitignore 忽略），不要写进代码或提交。
+ *   node sniper.js check        校验凭据 / 看钱包解锁状态 / 测 RTT / 看校时偏差
+ *   node sniper.js detail       拉 bill_detail,尝试探测公示结束时间/价格
+ *   node sniper.js snipe        部署抢号(默认)
+ *   node sniper.js paste [文件]  从浏览器 Copy as cURL 更新凭据(无文件则读 stdin)
+ *   node sniper.js test-email   发测试邮件
  */
 
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const { URL } = require('url');
+const core = require('./core');
+const { log, warn, errlog, fmtBeijing, parseBeijing, mask } = core;
 
-// ====================== 配置 ======================
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
 function loadConfig() {
-  if (!fs.existsSync(CONFIG_PATH)) {
-    console.error('找不到 config.json。请先 `cp config.example.json config.json` 并填写。');
-    process.exit(1);
-  }
   let cfg;
-  try {
-    cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-  } catch (e) {
-    console.error('config.json 不是合法 JSON：', e.message);
-    process.exit(1);
-  }
-  // 命令行覆盖：--bill xxx --at "2026-06-05 20:00:00"
+  try { cfg = core.loadConfigFile(CONFIG_PATH); }
+  catch (e) { console.error(e.message); process.exit(1); }
   const args = process.argv.slice(3);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--bill') cfg.bill = args[++i];
     else if (args[i] === '--at') cfg.fireAt = args[++i];
     else if (args[i] === '--lead') cfg.fireLeadMs = Number(args[++i]);
   }
-  cfg.apiBase = cfg.apiBase || 'https://fortunaapi.leitinggame.com.cn';
-  cfg.gameCode = cfg.gameCode || 'xianP';
-  cfg.itype = cfg.itype != null ? cfg.itype : 2;
-  cfg.payType = cfg.payType != null ? cfg.payType : 2;
-  cfg.maxBuyAttempts = cfg.maxBuyAttempts || 4;
   return cfg;
 }
 
-// ====================== 凭据：从 cURL 解析 / 写回 / 热加载 ======================
-// 解析浏览器「Copy as cURL (bash)」整段，抠出 cookie / uid / token / UA。
-function parseCurl(text) {
-  const out = {};
-  const pick = (re) => { const m = text.match(re); return m ? m[1].trim() : null; };
-  // cookie：-b '...' 或 --cookie '...' 或 -H 'cookie: ...'
-  out.cookie = pick(/(?:-b|--cookie)\s+'([^']*)'/i) || pick(/-H\s+'cookie:\s*([^']*)'/i);
-  out.token = pick(/-H\s+'web-login-token:\s*([^']*)'/i);
-  out.uid = pick(/-H\s+'web-login-uid:\s*([^']*)'/i);
-  out.userAgent = pick(/-H\s+'user-agent:\s*([^']*)'/i);
-  // uid 兜底：从 cookie 里的 ltl_formal_account 解出来
-  if (!out.uid && out.cookie) {
-    const m = out.cookie.match(/ltl_formal_account=([^;]+)/);
-    if (m) {
-      try {
-        const j = JSON.parse(decodeURIComponent(m[1]));
-        if (j.uid) out.uid = String(j.uid);
-        if (!out.token && j.token) out.token = String(j.token);
-      } catch (e) { /* ignore */ }
-    }
-  }
-  // 清掉空值
-  Object.keys(out).forEach((k) => { if (!out[k]) delete out[k]; });
-  return out;
+let CFG;
+
+// 运行中热加载凭据(配合 paste / 手改 config.json)
+function reloadCreds() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    const creds = {};
+    for (const k of ['cookie', 'token', 'uid', 'userAgent']) if (cfg[k]) creds[k] = cfg[k];
+    if (core.applyCreds(creds)) log(`🔄 凭据已热更新(cookie=${mask(CFG.cookie)})`);
+  } catch (e) { /* 文件可能正写一半 */ }
 }
 
-// 把凭据字段合并写回 config.json（保留其它字段）
 function saveCredsToConfig(creds) {
   const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   Object.assign(cfg, creds);
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
-const mask = (s) => (s && s.length > 12 ? s.slice(0, 6) + '***' + s.slice(-4) : (s ? '***' : '(空)'));
-
-// 运行中热加载：仅刷新凭据字段，不动已部署的计划/校时
-function reloadCreds() {
-  try {
-    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    let changed = false;
-    for (const k of ['cookie', 'token', 'uid', 'userAgent']) {
-      if (cfg[k] && cfg[k] !== CFG[k]) { CFG[k] = cfg[k]; changed = true; }
-    }
-    if (changed) log(`🔄 凭据已热更新（cookie=${mask(CFG.cookie)}）`);
-  } catch (e) { /* 文件可能正写到一半，忽略本次 */ }
-}
-
-// ====================== 日志 ======================
-function ts() {
-  const d = new Date(Date.now() + 8 * 3600 * 1000); // 北京时间显示
-  const p = (n, w = 2) => String(n).padStart(w, '0');
-  return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}.${p(d.getUTCMilliseconds(), 3)}`;
-}
-const log = (...a) => console.log(`[${ts()}]`, ...a);
-const warn = (...a) => console.warn(`[${ts()}] ⚠`, ...a);
-const errlog = (...a) => console.error(`[${ts()}] ✖`, ...a);
-
-// ====================== HTTP 客户端（keep-alive 长连接） ======================
-// 复用 TCP/TLS 连接，避免每次请求重新握手（冷启动握手约 110ms，复用后只剩 ~1 个 RTT）。
-const agent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 8,
-  keepAliveMsecs: 30 * 1000,
-});
-
-let CFG = null; // 全局，requestApi 用
-
-/**
- * 调用一个 API。返回 { status(http), json, raw, dateHeaderMs, t0, t1, rtt }。
- */
-function requestApi(pathname, bodyObj, opts = {}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(pathname, CFG.apiBase);
-    const body = bodyObj == null ? '' : JSON.stringify(bodyObj);
-    const headers = {
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'zh-CN,zh;q=0.9',
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body),
-      'Origin': 'https://www.leitinggame.com.cn',
-      'Referer': 'https://www.leitinggame.com.cn/',
-      'gamecode': CFG.gameCode,
-      'web-login-uid': CFG.uid || '',
-      'web-login-token': CFG.token || '',
-      'User-Agent': CFG.userAgent || 'Mozilla/5.0',
-    };
-    if (CFG.cookie) headers['Cookie'] = CFG.cookie;
-
-    const t0 = Date.now();
-    const req = https.request(
-      {
-        method: 'POST',
-        hostname: u.hostname,
-        path: u.pathname + u.search,
-        headers,
-        agent,
-        timeout: opts.timeout || 5000,
-      },
-      (res) => {
-        // 收到响应头的瞬间（Date 头此刻已到手）。校时用它做上界，排除 body 下载耗时。
-        const tHeaders = Date.now();
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          const t1 = Date.now();
-          const raw = Buffer.concat(chunks).toString('utf8');
-          const dateHdr = res.headers['date'];
-          const dateHeaderMs = dateHdr ? new Date(dateHdr).getTime() : NaN;
-          let json = null;
-          try { json = JSON.parse(raw); } catch (e) { /* 非 JSON */ }
-          resolve({ status: res.statusCode, json, raw, dateHeaderMs, t0, tHeaders, t1, rtt: t1 - t0, ttfb: tHeaders - t0 });
-        });
-      }
-    );
-    req.on('timeout', () => { req.destroy(new Error('timeout')); });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-// 接口路径（与抓包一致）
-const EP = {
-  getMyMoney: '/user/get_my_money',
-  billDetail: '/api/sellbill/bill_detail',
-  checkPrice: '/api/sellbill/check_price',
-  buyPrecheck: '/buybill/precheck',
-  buyOrder: '/buybill/buy',
-  buyLock: '/buybill/lock',
-};
-
-// ====================== 时间工具 ======================
-// 北京时间字符串 → epoch ms
-function parseBeijing(s) {
-  if (!s || typeof s !== 'string') return NaN;
-  const t = new Date(s.trim().replace(' ', 'T') + '+08:00').getTime();
-  return isNaN(t) ? NaN : t;
-}
-function fmtBeijing(ms) {
-  const d = new Date(ms + 8 * 3600 * 1000);
-  const p = (n, w = 2) => String(n).padStart(w, '0');
-  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
-         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}.${p(d.getUTCMilliseconds(), 3)}`;
-}
-
-// 心跳/校时探针：用 bill_detail（公开数据，不需要钱包解锁，随时可调）。
-function heartbeatProbe() {
-  if (CFG.bill) return requestApi(EP.billDetail, { billId: CFG.bill, part: 'basic' }, { timeout: 4000 });
-  return requestApi(EP.getMyMoney, null, { timeout: 4000 }); // 兜底
-}
-
-// ====================== 服务器校时 ======================
-// HTTP Date 头只有「秒」精度，单点采样最差会偏 1 秒。这里用区间交集法：
-// 每个样本给出 offset 的一个 [下界, 上界) 约束，多样本求交集把误差压到 ~RTT 量级。
-//   设服务器盖戳时刻 S，对应本地时刻在 [t0, tHeaders]（收到响应头那刻），offset = S - 本地。
-//   Date 头取整到秒得 serverSec，故 serverSec <= S < serverSec+1000。
-//   推得：  serverSec - tHeaders  <=  offset  <  serverSec + 1000 - t0
-async function syncClock(samples = 12) {
-  let lower = -Infinity, upper = Infinity;
-  let rttMin = Infinity;
-  let got = 0;
-  for (let i = 0; i < samples; i++) {
-    try {
-      const r = await heartbeatProbe();
-      if (!isNaN(r.dateHeaderMs)) {
-        const lo = r.dateHeaderMs - r.tHeaders;
-        const hi = r.dateHeaderMs + 1000 - r.t0;
-        if (lo > lower) lower = lo;
-        if (hi < upper) upper = hi;
-        rttMin = Math.min(rttMin, r.ttfb);
-        got++;
-      }
-    } catch (e) { /* 单次失败忽略 */ }
-    await sleep(120);
-  }
-  if (!got || lower === -Infinity || upper === Infinity) {
-    warn('校时失败，offset 视为 0');
-    return { offset: 0, precision: NaN, rttMin: NaN };
-  }
-  const offset = Math.round((lower + upper) / 2);
-  const precision = Math.round(upper - lower); // 区间宽度，越小越准
-  return { offset, precision, rttMin };
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// ====================== 价格守门 ======================
-function pickPrice(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-  for (const k of ['price', 'currentPrice', 'sellPrice', 'salePrice']) {
-    if (obj[k] != null && !isNaN(Number(obj[k]))) return Number(obj[k]);
-  }
-  return null;
-}
-function pickPublicEnd(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-  for (const k of ['publicEndDate', 'publicEndTime', 'publicEnd', 'publicTime', 'publicEndAt']) {
-    if (obj[k]) return obj[k];
-  }
-  return null;
-}
-// 兼容双层 JSON / 数组 / 嵌套
-function normalize(raw) {
-  let d = raw;
-  if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { return null; } }
-  if (Array.isArray(d)) d = d[0];
-  if (d && typeof d === 'object') {
-    if (!pickPublicEnd(d) && !pickPrice(d)) {
-      for (const k of ['detail', 'bill', 'data', 'sellbill']) {
-        if (d[k] && typeof d[k] === 'object') { d = d[k]; break; }
-      }
-    }
-    return d;
-  }
-  return null;
-}
-
-async function fetchBillInfo(billId) {
-  // 试 check_price 拿当前价；再试 bill_detail 探测公示结束时间
-  const out = { price: null, publicEnd: null };
-  try {
-    const r = await requestApi(EP.checkPrice, { billId });
-    if (r.json && r.json.status === 0) {
-      const d = normalize(r.json.data || {});
-      const p = pickPrice(d);
-      if (p != null) out.price = p;
-    }
-  } catch (e) { /* ignore */ }
-  for (const part of ['basic', 'all', undefined]) {
-    try {
-      const body = part ? { billId, part } : { billId };
-      const r = await requestApi(EP.billDetail, body);
-      if (r.json && r.json.status === 0) {
-        const d = normalize(r.json.data);
-        if (d) {
-          if (out.price == null) out.price = pickPrice(d);
-          if (!out.publicEnd) out.publicEnd = pickPublicEnd(d);
-        }
-        if (out.publicEnd) break;
-      }
-    } catch (e) { /* ignore */ }
-  }
-  return out;
-}
-
-// ====================== 邮件通知 ======================
-let transporter = null;
-function getTransporter() {
-  if (transporter !== null) return transporter;
-  const e = CFG.email;
-  if (!e || !e.enabled) { transporter = false; return false; }
-  let nodemailer;
-  try { nodemailer = require('nodemailer'); }
-  catch (err) {
-    warn('未安装 nodemailer，邮件通知不可用。请在 node-sniper 目录跑 `npm install`。');
-    transporter = false;
-    return false;
-  }
-  transporter = nodemailer.createTransport({
-    host: e.host || 'smtp.gmail.com',
-    port: e.port || 465,
-    secure: e.secure !== false,
-    auth: { user: e.user, pass: e.pass },
-  });
-  return transporter;
-}
-async function sendMail(subject, text) {
-  const t = getTransporter();
-  if (!t) { log(`（未发邮件）${subject} — ${text}`); return; }
-  try {
-    await t.sendMail({
-      from: CFG.email.user,
-      to: CFG.email.to || CFG.email.user,
-      subject,
-      text,
-    });
-    log(`📧 已发邮件：${subject}`);
-  } catch (e) {
-    errlog('发邮件失败：', e.message);
-  }
-}
-
-// ====================== 抢号核心 ======================
-async function doBuy(billId) {
-  const body = { billId, itype: CFG.itype };
-  let last = null;
-  for (let attempt = 1; attempt <= CFG.maxBuyAttempts; attempt++) {
-    try {
-      const r = await requestApi(EP.buyOrder, body, { timeout: 4000 });
-      last = r;
-      log(`buy #${attempt} (${r.rtt}ms) → ${r.raw.slice(0, 300)}`);
-      if (r.json && r.json.status === 0) return r; // 成功
-      const msg = (r.json && r.json.message) || '';
-      // 业务明确失败：不再重试（避免重复下单）
-      if (/已售|已购|下架|不存在|失效|结束|被锁/.test(msg)) return r;
-      // 仅对疑似瞬时错误重试
-      if (!/过快|频繁|繁忙|稍后|重试|拥挤/.test(msg) && r.json) return r;
-    } catch (e) {
-      warn(`buy #${attempt} 异常：${e.message}`);
-      last = { error: e.message };
-    }
-    await sleep(60);
-  }
-  return last;
-}
-
-async function doLock(billId, orderId) {
-  try {
-    const r = await requestApi(EP.buyLock, { billId, id: orderId, payType: CFG.payType });
-    log(`lock → ${r.raw.slice(0, 200)}`);
-    return r;
-  } catch (e) {
-    warn('lock 异常：', e.message);
-    return null;
-  }
-}
-
-// 钱包是否处于已解锁状态：探一次涉财接口 get_my_money。
-// status===0 → 已解锁；否则（"请先完成校验"等）→ 未解锁/已过期。
-async function walletUnlocked() {
-  try {
-    const r = await requestApi(EP.getMyMoney, null, { timeout: 4000 });
-    return { ok: !!(r.json && r.json.status === 0), message: r.json && r.json.message };
-  } catch (e) {
-    return { ok: false, message: e.message };
-  }
-}
-
-async function fire(billId) {
-  const t0 = Date.now();
-  log(`🚀 fire ${billId}`);
-  const r = await doBuy(billId);
-  const elapsed = Date.now() - t0;
-
-  if (!r || !r.json || r.json.status !== 0) {
-    const msg = (r && r.json && r.json.message) || (r && r.error) || '未知错误';
-    errlog(`抢购失败（${elapsed}ms）：${msg}`);
-    await sendMail('❌ 雷霆抢购失败', `billId=${billId}\n原因：${msg}\n耗时：${elapsed}ms\n时间：${fmtBeijing(Date.now())}`);
-    return false;
-  }
-
-  const data = r.json.data || {};
-  const orderId = data.id || data.orderId || data.buyId || data.orderNo;
-  log(`🎉 抢购成功（${elapsed}ms）订单号 ${orderId}`);
-
-  let lockNote = '';
-  if (CFG.autoLock && orderId) {
-    const lr = await doLock(billId, orderId);
-    lockNote = lr && lr.json ? `\nlock: ${lr.json.message || lr.json.status}` : '\nlock: (无响应)';
-  }
-  await sendMail(
-    '🎉 雷霆抢购成功',
-    `billId=${billId}\n订单号：${orderId}\n耗时：${elapsed}ms\n时间：${fmtBeijing(Date.now())}\n` +
-    `请在 30 分钟内回浏览器完成支付。${lockNote}\n\nbuy 原始响应：\n${r.raw.slice(0, 800)}`
-  );
-  return true;
-}
-
-// 高精度等待到目标本地时刻后引爆：setTimeout 粗等到剩 50ms，再忙等收尾。
-function spinFireAt(targetLocalMs, billId) {
-  return new Promise((resolve) => {
-    const coarse = targetLocalMs - 50 - Date.now();
-    const run = () => {
-      while (Date.now() < targetLocalMs) { /* busy spin，最多约 50ms */ }
-      fire(billId).then(resolve);
-    };
-    if (coarse > 0) setTimeout(run, coarse);
-    else run();
-  });
-}
-
 // ====================== 命令 ======================
 async function cmdCheck() {
   log('校验凭据 + 测速 + 校时…');
-  if (!CFG.bill) { warn('config 里没有 bill，校验将退化用 get_my_money（需钱包已解锁）'); }
-
-  // 1) 凭据有效性：用 bill_detail（公开数据，不需要解锁）
-  const r = await heartbeatProbe();
-  if (!r.json) { errlog('响应非 JSON：', r.raw.slice(0, 200)); return; }
+  if (!CFG.bill) warn('config 里没有 bill,校验退化用 get_my_money(需钱包已解锁)');
+  const r = await core.heartbeatProbe();
+  if (!r.json) { errlog('响应非 JSON:', r.raw.slice(0, 200)); return; }
   if (r.json.status !== 0) {
-    errlog(`凭据无效：status=${r.json.status} message=${r.json.message}`);
-    errlog('→ 多半是 cookie/token 过期或被登出，回浏览器重新复制 cookie。');
+    errlog(`凭据无效:status=${r.json.status} message=${r.json.message}`);
+    errlog('→ 多半是 cookie/token 过期或被登出,回浏览器重新复制 cookie。');
     return;
   }
-  log('✅ 凭据有效（cookie 没过期、没登出）');
-
-  // 2) 钱包解锁状态：用 get_my_money 探一下
-  const w = await walletUnlocked();
-  if (w.ok) log('🔓 钱包当前已解锁，可立即抢号');
-  else log(`🔒 钱包当前未解锁（${w.message || ''}）—— 正常，开抢前 10 分钟内去浏览器解锁即可`);
-
-  // 3) 校时 + 测速
-  const clk = await syncClock();
-  log(`⏱ 校时 offset=${clk.offset}ms（精度±${Math.round(clk.precision / 2)}ms），最快 RTT=${clk.rttMin}ms`);
-  log(`服务器当前时间约：${fmtBeijing(Date.now() + clk.offset)}`);
+  log('✅ 凭据有效(cookie 没过期、没登出)');
+  const w = await core.walletUnlocked();
+  if (w.ok) log('🔓 钱包当前已解锁,可立即抢号');
+  else log(`🔒 钱包当前未解锁(${w.message || ''})—— 正常,开抢前 10 分钟内去浏览器解锁即可`);
+  const clk = await core.syncClock(() => (CFG.bill ? core.probeBill(CFG.bill) : core.heartbeatProbe()));
+  log(`⏱ 校时 offset=${clk.offset}ms(精度±${Math.round(clk.precision / 2)}ms),最快 RTT=${clk.rttMin}ms`);
+  log(`服务器当前时间约:${fmtBeijing(Date.now() + clk.offset)}`);
 }
 
 async function cmdDetail() {
   if (!CFG.bill) { errlog('config 里没有 bill'); return; }
-  const info = await fetchBillInfo(CFG.bill);
-  log('探测结果：', info);
-  if (info.publicEnd) log(`公示结束时间 → ${info.publicEnd}（可填进 config.fireAt）`);
-  else warn('未能自动探测公示结束时间，请手动在 config.fireAt 填写。');
+  const info = await core.fetchBillInfo(CFG.bill);
+  log('探测结果:', info);
+  if (info.publicEnd) log(`公示结束时间 → ${info.publicEnd}(可填进 config.fireAt)`);
+  else warn('未能自动探测公示结束时间,请手动在 config.fireAt 填写。');
 }
 
 async function cmdTestEmail() {
-  await sendMail('✅ 雷霆抢号机测试邮件', `这是一封测试邮件。\n时间：${fmtBeijing(Date.now())}`);
+  await core.sendMail('✅ 雷霆抢号机测试邮件', `这是一封测试邮件。\n时间:${fmtBeijing(Date.now())}`);
 }
 
-// 从 cURL 更新凭据：`node sniper.js paste [文件]`，无文件则读 stdin。
-// 解锁钱包后在浏览器 Copy as cURL，到服务器贴进来即可（正在跑的 snipe 会热加载）。
 async function cmdPaste() {
   const fileArg = process.argv[3];
   let text;
-  if (fileArg && fs.existsSync(fileArg)) {
-    text = fs.readFileSync(fileArg, 'utf8');
-  } else {
+  if (fileArg && fs.existsSync(fileArg)) text = fs.readFileSync(fileArg, 'utf8');
+  else {
     process.stdin.setEncoding('utf8');
-    if (process.stdin.isTTY) console.log('粘贴浏览器 Copy as cURL 的整段，然后回车按 Ctrl-D 结束：');
-    text = await new Promise((resolve) => {
-      let buf = '';
-      process.stdin.on('data', (d) => (buf += d));
-      process.stdin.on('end', () => resolve(buf));
-    });
+    if (process.stdin.isTTY) console.log('粘贴浏览器 Copy as cURL 的整段,然后回车按 Ctrl-D 结束:');
+    text = await new Promise((resolve) => { let buf = ''; process.stdin.on('data', (d) => (buf += d)); process.stdin.on('end', () => resolve(buf)); });
   }
-  const creds = parseCurl(text);
-  if (!creds.cookie && !creds.token) {
-    errlog('没解析到 cookie/token。请确认贴的是「Copy as cURL (bash)」的完整内容。');
-    process.exit(1);
-  }
+  const creds = core.parseCurl(text);
+  if (!creds.cookie && !creds.token) { errlog('没解析到 cookie/token。请确认贴的是「Copy as cURL (bash)」完整内容。'); process.exit(1); }
   saveCredsToConfig(creds);
   log('✅ 已更新凭据 → config.json');
   log(`   cookie=${mask(creds.cookie)}  uid=${creds.uid || '(未变)'}  token=${mask(creds.token)}`);
-  log('   若 snipe 正在运行，它会在 1~2 秒内自动热加载。');
+  log('   若 snipe 正在运行,它会在 1~2 秒内自动热加载。');
 }
 
 async function cmdSnipe() {
   if (!CFG.bill) { errlog('config 里没有 bill'); process.exit(1); }
-
-  // 1) 校验凭据（用 bill_detail，不需要钱包解锁；解锁留到开抢前由你在浏览器完成）
-  const chk = await heartbeatProbe();
+  const chk = await core.heartbeatProbe();
   if (!chk.json || chk.json.status !== 0) {
-    errlog(`凭据无效：${chk.json ? chk.json.message : chk.raw.slice(0, 120)}。请回浏览器重新复制 cookie（注意别点退出登录）。`);
+    errlog(`凭据无效:${chk.json ? chk.json.message : chk.raw.slice(0, 120)}。请回浏览器重新复制 cookie(别点退出登录)。`);
     process.exit(1);
   }
-  log('✅ 凭据有效（cookie 没过期）');
+  log('✅ 凭据有效(cookie 没过期)');
 
-  // 监听 config.json：解锁后用 `node sniper.js paste` 重贴凭据，这里热加载，不必重启
   fs.watchFile(CONFIG_PATH, { interval: 1000 }, reloadCreds);
-  log('👀 已监听 config.json，解锁后 `node sniper.js paste` 重贴凭据会自动热加载');
+  log('👀 已监听 config.json,解锁后 `node sniper.js paste` 重贴凭据会自动热加载');
 
-  // 2) 确定开抢时间
   let fireAt = parseBeijing(CFG.fireAt);
   if (isNaN(fireAt)) {
-    log('config.fireAt 为空，尝试自动探测…');
-    const info = await fetchBillInfo(CFG.bill);
-    if (info.publicEnd) { fireAt = parseBeijing(info.publicEnd); log(`探测到公示结束：${info.publicEnd}`); }
+    log('config.fireAt 为空,尝试自动探测…');
+    const info = await core.fetchBillInfo(CFG.bill);
+    if (info.publicEnd) { fireAt = parseBeijing(info.publicEnd); log(`探测到公示结束:${info.publicEnd}`); }
   }
-  if (isNaN(fireAt)) {
-    errlog('无法确定开抢时间。请在 config.fireAt 手动填写北京时间，如 "2026-06-05 20:00:00"。');
-    process.exit(1);
-  }
+  if (isNaN(fireAt)) { errlog('无法确定开抢时间。请在 config.fireAt 填北京时间,如 "2026-06-05 20:00:00"。'); process.exit(1); }
 
-  // 3) 校时
-  const clk = await syncClock();
-  log(`⏱ offset=${clk.offset}ms（精度±${Math.round(clk.precision / 2)}ms）最快 RTT=${clk.rttMin}ms`);
-
-  const lead = CFG.fireLeadMs != null ? CFG.fireLeadMs
-    : (isFinite(clk.rttMin) ? Math.round(clk.rttMin / 2) : 20); // 单程延迟补偿
-  const targetLocal = fireAt - clk.offset - lead;
-  const remain = targetLocal - Date.now();
-  log(`🎯 目标(服务器)：${fmtBeijing(fireAt)}`);
-  log(`   本地引爆点：${fmtBeijing(targetLocal)}（提前量 lead=${lead}ms）`);
-  log(`   倒计时：${(remain / 1000).toFixed(1)}s`);
-
-  if (remain <= 0) {
-    warn('已过开抢时间，立即尝试一次。');
-    await fire(CFG.bill);
-    return;
-  }
-
-  // 4) 可选：价格守门（提前 ~8s 检查改价）
-  if (CFG.expectPrice != null) {
-    const checkAt = Math.max(0, remain - 8000);
-    setTimeout(async () => {
-      const info = await fetchBillInfo(CFG.bill);
-      if (info.price != null) {
-        const diff = Math.abs(info.price - CFG.expectPrice);
-        if (diff > (CFG.priceTolerance || 0)) {
-          errlog(`价格已变 ¥${CFG.expectPrice} → ¥${info.price}，超过容差，中止抢号！`);
-          await sendMail('❌ 雷霆抢号已中止（改价）', `期望 ¥${CFG.expectPrice}，当前 ¥${info.price}`);
-          process.exit(0);
-        }
-        log(`价格校验通过：¥${info.price}`);
-      } else warn('价格校验取价失败，继续抢号。');
-    }, checkAt);
-  }
-
-  // 5) 解锁看守：开抢前若钱包还锁着，buy 必失败。在 T-8min / T-3min / T-1min 探测，
-  //    锁着就发邮件催你去浏览器解锁（解锁绑同一 SESSION，浏览器解锁后 ECS 自动也解锁）。
-  let unlockNagged = false;
-  for (const lead2 of [8 * 60000, 3 * 60000, 60000]) {
-    const at = remain - lead2;
-    if (at <= 0) continue;
-    setTimeout(async () => {
-      const w = await walletUnlocked();
-      if (w.ok) { log(`🔓 钱包已解锁（剩 ${(lead2 / 60000)}min）就绪`); }
-      else {
-        warn(`🔒 钱包未解锁（剩 ${(lead2 / 60000)}min）：${w.message || ''} —— 快去浏览器解锁！`);
-        if (!unlockNagged) {
-          unlockNagged = true;
-          sendMail('🔒 雷霆抢号提醒：钱包未解锁',
-            `距开抢约 ${(lead2 / 60000)} 分钟，钱包还锁着，buy 会失败！\n` +
-            `请立刻在浏览器解锁钱包（输支付密码）。billId=${CFG.bill}\n开抢：${fmtBeijing(fireAt)}`);
-        }
-      }
-    }, at);
-  }
-
-  // 6) 连接预热：最后 30s 每 3s 发一次 bill_detail，保持 socket 热 + 持续校时
-  const warmStart = Math.max(0, remain - 30000);
-  setTimeout(function warmLoop() {
-    const left = targetLocal - Date.now();
-    if (left <= 200) return;
-    heartbeatProbe().catch(() => {});
-    setTimeout(warmLoop, 3000);
-  }, warmStart);
-
-  // 7) 引爆
-  log('部署完成，等待引爆…（Ctrl-C 取消）');
-  await spinFireAt(targetLocal, CFG.bill);
+  await core.deploySnipe(
+    { bill: CFG.bill, fireAtMs: fireAt, name: CFG.bill, expectPrice: CFG.expectPrice, priceTolerance: CFG.priceTolerance },
+    { onComplete: () => { fs.unwatchFile(CONFIG_PATH); setTimeout(() => process.exit(0), 500); } }
+  );
+  log('部署完成,等待引爆…(Ctrl-C 取消)');
 }
 
 // ====================== 入口 ======================
 (async function main() {
   CFG = loadConfig();
+  core.configure(CFG);
   const cmd = process.argv[2] || 'snipe';
   try {
     if (cmd === 'check') await cmdCheck();
@@ -598,10 +139,6 @@ async function cmdSnipe() {
     else if (cmd === 'test-email') await cmdTestEmail();
     else if (cmd === 'paste') await cmdPaste();
     else if (cmd === 'snipe') await cmdSnipe();
-    else { console.error(`未知命令：${cmd}（可用：check | detail | snipe | paste | test-email）`); process.exit(1); }
-  } catch (e) {
-    errlog('致命错误：', e && e.stack ? e.stack : e);
-    process.exit(1);
-  }
-  // snipe 走到这里若还有定时器会继续等；其他命令自然退出
+    else { console.error(`未知命令:${cmd}(可用:check | detail | snipe | paste | test-email)`); process.exit(1); }
+  } catch (e) { errlog('致命错误:', e && e.stack ? e.stack : e); process.exit(1); }
 })();

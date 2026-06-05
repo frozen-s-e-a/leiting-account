@@ -36,5 +36,13 @@
     "user": "ysj957503@gmail.com",
     "pass": "你的-gmail-应用专用密码",
     "to": "ysj957503@gmail.com"
+  },
+
+  "_桥接服务": "bridge.js 守护进程用。secret 用长随机串(node -e \"console.log(require('crypto').randomBytes(24).toString('base64url'))\")。安全组务必把 port 限到你家IP。host 用 SSH 隧道时改 127.0.0.1。idleShutdownMin=抢完无任务后多少分钟自动退出,0=永不退。",
+  "bridge": {
+    "port": 8787,
+    "host": "0.0.0.0",
+    "secret": "改成一串足够长的随机密钥",
+    "idleShutdownMin": 40
   }
 }

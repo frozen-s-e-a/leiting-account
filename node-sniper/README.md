@@ -102,6 +102,69 @@ T-10min 内  ① 浏览器解锁钱包(输支付密码)
 > 建议先用一个**冷门/便宜**的号实测一次,把日志贴出来,验证 `itype` / 订单号字段 /
 > `lock` 行为,再上热门号。
 
+## 桥接模式:浏览器一键下发(推荐,免手动搬数据)
+
+`bridge.js` 是常驻 ECS 的守护进程;浏览器用户脚本(v3.2+)把凭据/任务自动推过来。
+选号、登录、过验证、解锁都在浏览器(熟悉的界面),扣扳机在 ECS。
+
+```
+浏览器(用户脚本)                         ECS(bridge.js 守护)
+  登录后 → 自动 POST /sync(凭据) ───────────►  存入内存
+  解锁钱包 → 自动 POST /sync(凭据) ──────────►  热更新(确保拿到解锁后的 cookie)
+  详情页点「🚀 下发到服务器抢号」→ POST /task ─►  部署抢号,到点引爆 → 邮件
+                                            抢完无任务 → 空闲 40 分钟自动退出
+```
+
+### 服务端启动
+
+```bash
+cd node-sniper && npm install
+cp config.example.json config.json     # 填 email + bridge.secret
+# 生成强密钥:
+node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
+node bridge.js                         # 前台跑;长期挂用 pm2 / systemd / nohup
+```
+
+接口(都需头 `X-Sniper-Secret: <secret>`):
+`POST /sync` · `POST /task` · `GET /status` · `POST /cancel`
+
+### 浏览器端
+
+1. 装/更新用户脚本到 v3.2+
+2. 油猴菜单「⚙️ 配置抢号服务器」→ 填 `http://你的ECS_IP:8787` + secret
+3. 之后:**登录自动同步、解锁自动同步**;详情页菜单「🚀 把当前账号下发到服务器抢号」即部署
+4. 开抢前 10 分钟内在浏览器解锁钱包 → 自动再同步一次(带上解锁后的最新 cookie)
+
+### 安全(务必)
+
+接收 cookie 的端口暴露在公网有风险。**三件事必须做**:
+
+1. **强密钥**:`bridge.secret` 用上面生成的随机串,别用弱口令
+2. **安全组锁 IP**:云控制台把该端口入方向**只放行你家宽带 IP**
+   - 家宽 IP 会变,变了去改一下;**手机请连家里 WiFi**(4G/5G 是大内网,锁不住)
+3. 不用时让它自动退出(`idleShutdownMin`,默认 40)
+
+> 在线查自己当前公网 IP:浏览器搜「我的IP」。
+
+### 更安全:SSH 隧道(可选)
+
+不想开公网端口,就把 `bridge.host` 改成 `127.0.0.1`(只在本机监听),
+然后在**你家电脑**上跑:
+
+```bash
+ssh -L 8787:localhost:8787 root@你的ECS_IP
+```
+
+它把"你电脑的 8787"经加密 SSH 接到"ECS 的 8787"。用户脚本服务器地址填
+`http://localhost:8787`。ECS 端口不公开,流量加密。代价:同步时家里要挂着这条命令
+(抢号本身不需要,ECS 自己会打)。
+
+### 开机自启 / 按需唤醒(可选)
+
+- 简单常驻:`pm2 start bridge.js --name sniper-bridge` 或写个 systemd service
+- 真正「按需启动、空闲退出」:用 **systemd socket 激活**(systemd 替你监听端口,
+  来请求才拉起进程,空闲退出后下次请求再拉起)。需要时我可以给你 `.socket` / `.service` 模板。
+
 ## 关键设计
 
 - **校时**:HTTP `Date` 头只有秒精度,用「区间交集法」多采样把误差压到 ~RTT 量级

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         雷霆交易平台·账号抢购助手
 // @namespace    user.leitinggame.sniper
-// @version      3.1.0
-// @description  公示期结束瞬间直接调 /buybill/buy 抢购；多源凭据；Worker 防限流；服务器校时；可视化任务面板；自动更新
+// @version      3.2.0
+// @description  公示期结束瞬间直接调 /buybill/buy 抢购；多源凭据；Worker 防限流；服务器校时；可视化任务面板；服务端桥接（登录/解锁自动同步凭据、一键下发到 ECS 抢号）；自动更新
 // @author       leiting-account
 // @match        https://www.leitinggame.com.cn/*
 // @run-at       document-start
@@ -12,7 +12,9 @@
 // @grant        GM_listValues
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      *
 // @homepageURL  https://github.com/frozen-s-e-a/leiting-account
 // @supportURL   https://github.com/frozen-s-e-a/leiting-account/issues
 // @updateURL    https://raw.githubusercontent.com/frozen-s-e-a/leiting-account/main/leiting-sniper.user.js
@@ -127,6 +129,7 @@
             x.addEventListener('loadend', () => {
                 tryCaptureAuthFromHeaders(_u, hdrs);
                 tryCaptureClockFromResponse(x);
+                try { detectUnlock(_u, x.responseText); } catch (e) {}
             });
             _send(body);
         };
@@ -151,6 +154,9 @@
             try {
                 tryCaptureAuthFromHeaders(url, hdrs);
                 tryCaptureClockFromFetchResponse(resp);
+                if (url && url.includes('get_my_money')) {
+                    resp.clone().text().then(t => { try { detectUnlock(url, t); } catch (e) {} }).catch(() => {});
+                }
             } catch (e) {}
             return resp;
         } catch (e) { throw e; }
@@ -880,7 +886,80 @@
 
     // ====================== 控制台 & 油猴菜单 ======================
     // Tampermonkey 沙箱：写 window.x 在沙箱里，控制台访问不到；要写 unsafeWindow
+    // ====================== 服务端桥接（推送到 ECS 抢号） ======================
+    // 把凭据/任务通过 GM_xmlhttpRequest 推到 ECS 上的 bridge.js。
+    // 用 GM_xmlhttpRequest 是为了绕过跨域 + HTTPS→HTTP 混合内容限制。
+    const SRV_KEY = 'sniper_server_cfg';            // { url, secret }
+    function getServer() { return GM_getValue(SRV_KEY, null); }
+    function setServer() {
+        const cur = getServer() || {};
+        const url = prompt('服务器地址（如 http://你的ECS_IP:8787）', cur.url || 'http://0.0.0.0:8787');
+        if (!url) return;
+        const secret = prompt('密钥（config.bridge.secret 里那串）', cur.secret || '');
+        if (!secret) return;
+        GM_setValue(SRV_KEY, { url: url.replace(/\/+$/, ''), secret });
+        alert('已保存服务器配置：' + url);
+    }
+    function gmPost(path, body) {
+        const srv = getServer();
+        if (!srv || !srv.url || !srv.secret) return Promise.reject(new Error('未配置服务器，请先「⚙️ 配置抢号服务器」'));
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST', url: srv.url + path, timeout: 8000,
+                headers: { 'Content-Type': 'application/json', 'X-Sniper-Secret': srv.secret },
+                data: JSON.stringify(body || {}),
+                onload: (r) => { try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(new Error('返回非 JSON: ' + (r.responseText || '').slice(0, 120))); } },
+                onerror: () => reject(new Error('网络错误（检查地址/端口/安全组）')),
+                ontimeout: () => reject(new Error('超时')),
+            });
+        });
+    }
+    function collectCreds() {
+        const a = getAuth() || {};
+        return { cookie: document.cookie, uid: a.uid, token: a.token, userAgent: navigator.userAgent };
+    }
+    async function syncToServer(kind) {
+        if (!getServer()) return;                   // 没配服务器就静默跳过
+        try {
+            const r = await gmPost('/sync', collectCreds());
+            log(`🔄 已同步凭据到服务器（${kind}）`, r);
+            return r;
+        } catch (e) { warn('同步到服务器失败：', e.message); }
+    }
+    // 解锁检测：get_my_money 返回 status:0 即视为「钱包已解锁」，自动再同步一次
+    let _lastUnlockSync = 0;
+    function detectUnlock(url, text) {
+        if (!url || !url.includes('get_my_money') || !text) return;
+        let j; try { j = JSON.parse(text); } catch (e) { return; }
+        if (j && j.status === 0) {
+            const now = Date.now();
+            if (now - _lastUnlockSync < 5000) return; // 防抖
+            _lastUnlockSync = now;
+            log('🔓 检测到钱包已解锁，自动同步到服务器');
+            syncToServer('unlock');
+        }
+    }
+    // 把当前账号作为任务下发到服务器（选号在浏览器，扣扳机在 ECS）
+    async function deployToServer(billId) {
+        if (!getServer()) { alert('请先「⚙️ 配置抢号服务器」'); return; }
+        let d = await apiBillSimple(billId) || scrapeBillFromDom(billId);
+        if (!d) { try { d = await apiBillDetail(billId); } catch (e) {} }
+        const publicEndDate = d && pickPublicEndDate(d);
+        const price = d && pickPrice(d);
+        if (!publicEndDate) { alert('未取到公示结束时间，无法下发。请在详情页操作，或先把 fireAt 手填到服务器 config。'); return; }
+        const name = (d && (d.name || d.gameName)) || `账号 ${billId}`;
+        try {
+            await syncToServer('deploy');           // 先把最新凭据带过去
+            const r = await gmPost('/task', { bill: billId, fireAt: publicEndDate, name, expectPrice: price != null ? price : undefined });
+            if (r && r.ok) alert(`✅ 已下发到服务器抢号\n${name}\n开抢：${publicEndDate}\n\n开抢前 10 分钟内记得在浏览器解锁钱包（会自动再同步一次）`);
+            else alert('下发失败：' + (r && r.error || '未知'));
+        } catch (e) { alert('下发失败：' + e.message); }
+    }
+
     const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    W.sniperSetServer = setServer;
+    W.sniperSyncToServer = syncToServer;
+    W.sniperDeployToServer = deployToServer;
     W.startSnipe = startSnipe;
     W.cancelSnipe = cancelSnipe;
     W.listSnipeTasks = listTasks;
@@ -903,6 +982,15 @@
     });
     // 取消任务 / 清空任务 都统一到可视化面板里操作（带按钮）
     GM_registerMenuCommand('❌ 取消 / 清空任务（打开面板）', showTaskPanel);
+    // ---- 服务端桥接菜单 ----
+    GM_registerMenuCommand('⚙️ 配置抢号服务器', setServer);
+    GM_registerMenuCommand('🔄 立即同步凭据到服务器', async () => { const r = await syncToServer('manual'); alert(r && r.ok ? '已同步到服务器' : '同步失败（看控制台）'); });
+    GM_registerMenuCommand('🚀 把当前账号下发到服务器抢号', async () => {
+        let billId = extractBillIdFromUrl();
+        if (!billId) billId = prompt('请输入 billId');
+        if (!billId) return;
+        await deployToServer(billId.trim());
+    });
 
     function init() {
         // 立刻尝试一次凭据采集
@@ -911,6 +999,8 @@
         else warn('暂未拿到凭据，请确保已登录并刷新页面');
         // 主动校时
         setTimeout(activeSyncClock, 1000);
+        // 登录后同步一次凭据到服务器（已配置服务器时）
+        if (a && getServer()) setTimeout(() => syncToServer('login'), 1500);
         // 任务恢复
         setTimeout(() => { restoreTasks(); injectFloatingButton(); }, 2500);
         setInterval(() => { restoreTasks(); injectFloatingButton(); }, 5000);
