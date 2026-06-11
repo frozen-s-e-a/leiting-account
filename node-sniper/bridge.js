@@ -30,7 +30,18 @@ const { log, warn, errlog, parseBeijing, mask } = core;
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const CREDS_PATH = path.join(__dirname, '.creds.json');
+const RESULTS_PATH = path.join(__dirname, '.results.jsonl');
 const WORKER = path.join(__dirname, 'worker.js');
+const STARTED_AT = Date.now();
+
+// 读最近 N 条抢号结果(JSON Lines,从尾部读)
+function readHistory(limit = 20) {
+  try {
+    const data = fs.readFileSync(RESULTS_PATH, 'utf8');
+    const lines = data.split('\n').filter(Boolean);
+    return lines.slice(-Math.max(1, Math.min(limit, 200))).map((l) => { try { return JSON.parse(l); } catch (e) { return { bad: l.slice(0, 80) }; } }).reverse();
+  } catch (e) { return []; }
+}
 
 let CFG;
 try { CFG = core.loadConfigFile(CONFIG_PATH); }
@@ -86,19 +97,32 @@ function send(res, code, obj) { res.writeHead(code, { 'Content-Type': 'applicati
 
 const server = http.createServer(async (req, res) => {
   const ip = req.socket.remoteAddress;
+  const url = (req.url || '').split('?')[0];
+
+  // /health 不需鉴权:只回最小信息,供外部监控拨测
+  if (req.method === 'GET' && url === '/health') {
+    return send(res, 200, { ok: true, uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000), workers: Object.keys(workers).length });
+  }
+
   if (!safeEqual(req.headers['x-sniper-secret'] || '', SECRET)) {
     warn(`401 来自 ${ip} ${req.method} ${req.url}`);
     return send(res, 401, { ok: false, error: 'unauthorized' });
   }
-  const url = (req.url || '').split('?')[0];
 
   try {
     if (req.method === 'GET' && url === '/status') {
       return send(res, 200, {
         ok: true,
+        uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000),
         creds: { cookie: mask(CFG.cookie), uid: CFG.uid || null, token: mask(CFG.token) },
         workers: Object.entries(workers).map(([bill, w]) => ({ bill, ...w.meta })),
       });
+    }
+
+    if (req.method === 'GET' && url === '/history') {
+      const m = (req.url || '').match(/[?&]limit=(\d+)/);
+      const limit = m ? Number(m[1]) : 20;
+      return send(res, 200, { ok: true, results: readHistory(limit) });
     }
 
     if (req.method === 'POST' && url === '/sync') {
@@ -146,6 +170,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   log(`🌉 抢号桥已启动(常驻):监听 ${HOST}:${PORT}`);
-  log('   接口:POST /sync · POST /task · GET /status · POST /cancel(均需 X-Sniper-Secret)');
+  log('   接口:POST /sync · POST /task · GET /status · GET /history · POST /cancel(需 X-Sniper-Secret)');
+  log('         GET /health(无需密钥,供监控拨测)');
   if (HOST === '0.0.0.0') warn('正在公网监听!请确认安全组已把该端口限制到你的 IP,且 secret 足够强。');
 });

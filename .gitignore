@@ -1,6 +1,7 @@
 # 凭据 / 密钥 —— 绝不入库
 node-sniper/config.json
 node-sniper/.creds.json
+node-sniper/.results.jsonl
 **/config.json
 *.secret
 .env

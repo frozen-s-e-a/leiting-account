@@ -19,6 +19,12 @@ const { log, warn, errlog, parseBeijing, mask, applyCreds } = core;
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const CREDS_PATH = path.join(__dirname, '.creds.json');
+const RESULTS_PATH = path.join(__dirname, '.results.jsonl');
+
+function appendResult(entry) {
+  try { fs.appendFileSync(RESULTS_PATH, JSON.stringify(entry) + '\n', { mode: 0o600 }); }
+  catch (e) { warn('写结果文件失败:', e.message); }
+}
 
 function pickCreds(o) {
   const c = {};
@@ -59,8 +65,17 @@ process.on('SIGINT', () => shutdown(0));
   try {
     handle = await core.deploySnipe(
       { bill: task.bill, fireAtMs, name: task.name || task.bill, expectPrice: task.expectPrice, priceTolerance: task.priceTolerance },
-      { onComplete: (success) => {
-          log(`任务完成:${success ? '成功' : '失败'}`);
+      { onComplete: (result) => {
+          log(`任务完成:${result.success ? '成功' : '失败'}${result.orderId ? ' 订单 ' + result.orderId : ''}`);
+          appendResult({
+            ts: Date.now(),
+            bill: task.bill,
+            name: task.name || task.bill,
+            fireAt: task.fireAt,
+            success: !!result.success,
+            orderId: result.orderId || null,
+            message: result.message || null,
+          });
           if (lingerMin > 0) setTimeout(() => shutdown(0), lingerMin * 60000);
           else shutdown(0);
         } }

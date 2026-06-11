@@ -123,7 +123,7 @@ async function cmdSnipe() {
 
   await core.deploySnipe(
     { bill: CFG.bill, fireAtMs: fireAt, name: CFG.bill, expectPrice: CFG.expectPrice, priceTolerance: CFG.priceTolerance },
-    { onComplete: () => { fs.unwatchFile(CONFIG_PATH); setTimeout(() => process.exit(0), 500); } }
+    { onComplete: (_result) => { fs.unwatchFile(CONFIG_PATH); setTimeout(() => process.exit(0), 500); } }
   );
   log('部署完成,等待引爆…(Ctrl-C 取消)');
 }

@@ -303,9 +303,9 @@ async function deploySnipe(task, hooks = {}) {
   const remain = targetLocal - Date.now();
   log(`🎯 ${task.name || task.bill}: 目标(服务器) ${fmtBeijing(task.fireAtMs)} | 本地引爆 ${fmtBeijing(targetLocal)} | lead=${lead}ms offset=${clk.offset}ms(±${Math.round(clk.precision / 2)}ms) | 倒计时 ${(remain / 1000).toFixed(1)}s`);
 
-  const done = (success) => { handle.status = success ? 'success' : 'failed'; if (hooks.onComplete) hooks.onComplete(success, task); };
+  const done = (result) => { handle.status = result.success ? 'success' : 'failed'; if (hooks.onComplete) hooks.onComplete(result, task); };
 
-  if (remain <= 0) { warn('已过开抢时间,立即尝试一次'); const r = await fire(task.bill, task.name); done(r.success); return handle; }
+  if (remain <= 0) { warn('已过开抢时间,立即尝试一次'); const r = await fire(task.bill, task.name); done(r); return handle; }
 
   // 解锁看守
   let nag = false;
@@ -332,7 +332,7 @@ async function deploySnipe(task, hooks = {}) {
       if (info.price != null && Math.abs(info.price - task.expectPrice) > (task.priceTolerance || 0)) {
         errlog(`价格已变 ¥${task.expectPrice} → ¥${info.price},超容差,中止!`);
         await sendMail('❌ 雷霆抢号已中止(改价)', `${task.name || task.bill}\n期望 ¥${task.expectPrice},当前 ¥${info.price}`);
-        cancel(); if (hooks.onComplete) hooks.onComplete(false, task);
+        cancel(); if (hooks.onComplete) hooks.onComplete({ success: false, message: `aborted: price ${task.expectPrice}→${info.price}` }, task);
       } else if (info.price != null) log(`价格校验通过:¥${info.price}`);
     }, at));
   }
@@ -352,7 +352,7 @@ async function deploySnipe(task, hooks = {}) {
     if (handle.cancelled) return;
     handle.status = 'firing';
     while (Date.now() < targetLocal) { /* busy spin ≤50ms */ }
-    fire(task.bill, task.name).then((r) => done(r.success));
+    fire(task.bill, task.name).then((r) => done(r));
   }, Math.max(0, targetLocal - 50 - Date.now())));
 
   return handle;
